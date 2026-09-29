@@ -92,22 +92,28 @@ client_proxy_env() {
   export no_proxy="$NO_PROXY"
 }
 maa_wanted() { [ "${AXH_MAA_ENABLED:-0}" = 1 ] && [ ! -e "$MAA/data/muse-daemon.stop" ]; }
-maa_healthy() { is_ours "$(cat "$RUN/maa.child" 2>/dev/null)" "$(child_match maa)" && recent "$RUN/maa.ok" 120; }
+maa_healthy() { is_ours "$(cat "$RUN/maa.child" 2>/dev/null)" "$(child_match maa)" && python3 "$AXH_HOME/maa-status.py" --health; }
 run_maa() {
-  local old args=(--loop 10000 --decision allow_once --no-fallback)
+  local old args=(--loop 10000 --always --scope destination_domain --fallback-once)
   [ -f "$MAA/muse-daemon.cjs" ] || die "run maa-install first"
   old=$(cat "$MAA/data/muse-daemon.pid" 2>/dev/null)
   if is_ours "$old" "$MAA/muse-daemon.cjs"; then die "existing MuseAutoApprove: stop previous launcher before adopting"; fi
-  rm -f "$MAA/data/muse-daemon.pid" "$RUN/maa.ok" "$RUN/maa.coverage.json"
-  case "${AXH_MAA_DECISION:-allow_once}" in
-    allow_once) ;;
-    allow_always) args=(--loop 10000 --always --scope destination_domain --fallback-once);;
+  [ -n "${MUSE_VM_ID:-}" ] || die "current MUSE_VM_ID required"
+  rm -f "$MAA/data/muse-daemon.pid"
+  date +%s%3N > "$RUN/maa.started"
+  case "${AXH_MAA_DECISION:-allow_always}" in
+    allow_always) ;;
+    allow_once) args=(--loop 10000 --decision allow_once --no-fallback);;
     *) die "AXH_MAA_DECISION must be allow_once or allow_always";;
   esac
   load_proxy || return 2
-  if [ "${AXH_MAA_PROXY:-direct}" = edge ]; then export MUSE_PROXY="$(forward_url)"; fi
+  case "${AXH_MAA_PROXY:-direct}" in
+    edge) export MUSE_PROXY="$(forward_url)";;
+    direct) unset MUSE_PROXY;;
+    *) die "AXH_MAA_PROXY must be direct or edge";;
+  esac
   cd "$MAA" || return 1
-  exec "${AXH_NODE_BIN:-node}" --require "$AXH_HOME/maa-adapter.cjs" "$MAA/muse-daemon.cjs" "${args[@]}"
+  exec "${AXH_NODE_BIN:-node}" "$MAA/muse-daemon.cjs" "${args[@]}"
 }
 run_axonhub() {
   client_proxy_env
@@ -215,7 +221,7 @@ cmd_install() {
   command -v curl >/dev/null || die "need curl"
   local src helper
   src=$(cd "$(dirname "$0")" && pwd)
-  for helper in cloudflared-edge-shim.py cloudflared-ns.sh axh_proxy.py axh-forward-proxy.py maa-adapter.cjs maa-install.sh muse-hooks.py muse-hook.sh; do
+  for helper in cloudflared-edge-shim.py cloudflared-ns.sh axh_proxy.py axh-forward-proxy.py maa-status.py maa-install.sh muse-hooks.py muse-hook.sh; do
     [ -f "$src/$helper" ] || die "missing $src/$helper; copy all scripts together"
     if [ "$src" != "$AXH_HOME" ]; then
       install -m700 "$src/$helper" "$AXH_HOME/$helper.new" && mv -f "$AXH_HOME/$helper.new" "$AXH_HOME/$helper" || die "cannot install $helper"
@@ -252,7 +258,7 @@ cmd_install() {
 # AXH_MODE=quick                              # 无域名/令牌的临时方案，固定域名存在时不回退
 # AXH_PLATFORM_REQUIRED=1                    # Muse: health 必须看到近期平台新会话执行记录
 # AXH_MAA_ENABLED=1                          # maa-install + 凭据/当前 MUSE_VM_ID 就绪后启用
-# AXH_MAA_DECISION=allow_once                 # 可选 allow_always：按域名永久允许
+# AXH_MAA_DECISION=allow_always               # 上游默认：按域永久允许，失败回退单次；可选 allow_once
 # MUSE_VM_ID=...                              # 当前 VM ID，重建后核实
 # AXH_NODE_BIN=/absolute/path/to/node         # Node 22+，重建后仍存在的路径
 # AXH_MAA_PROXY=edge                         # 默认直连；需要平台代理才设置 edge
@@ -333,7 +339,7 @@ cmd_status() {
   if proxy_mode; then python3 "$AXH_HOME/axh_proxy.py" status; fi
   if maa_wanted; then
     echo "MAA successful poll: $(maa_healthy && echo recent || echo MISSING/STALE)"
-    "${AXH_NODE_BIN:-node}" "$AXH_HOME/maa-adapter.cjs" --status
+    python3 "$AXH_HOME/maa-status.py"
   fi
   echo "axonhub   health    : $(curl --noproxy '*' -fs -m 5 "$(L "$PORT")/health" >/dev/null 2>&1 && echo ok || echo FAIL)"
   echo "axonhub   initialized: $(initialized && echo yes || echo NO)"

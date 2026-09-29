@@ -52,79 +52,100 @@ class HookTests(unittest.TestCase):
 
 
 class AutoApproveTests(unittest.TestCase):
-    def test_adapter_limits_scope_redacts_and_reports_successful_rpc(self):
+    def test_unmodified_upstream_approves_host_schema_and_falls_back(self):
+        """Fixture is byte-identical to muse-guardian 681759c; only IO is stubbed."""
         if not shutil.which('node'):
             self.skipTest('Node required')
+        import hashlib
+        # Source: https://github.com/bytehola/muse-guardian/blob/681759cf9633ea740af5e64037b667b52bb44a1b/MuseAutoApprove/muse-daemon.cjs
+        source = ROOT / 'tests/fixtures/muse-daemon.cjs'
+        self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(),
+                         'feae37f72c922b764f694225d57a0db55e385e0fa5113ac734f49eb289d2a456')
         with tempfile.TemporaryDirectory(prefix='axh-maa-') as directory:
             stack = Path(directory)
             app = stack / 'MuseAutoApprove'
-            for folder in ('work', 'log'):
+            for folder in ('work', 'log', 'data'):
                 (app / folder).mkdir(parents=True)
-            (stack / 'run').mkdir()
+            shutil.copy(source, app / 'muse-daemon.cjs')
+            (app / 'work/paths.cjs').write_text('''
+const path=require('path'); const root=path.resolve(__dirname,'..');
+module.exports={LOG_DIR:root+'/log',DAEMON_LOG_PATH:root+'/log/daemon-log.ndjson',
+AUTO_APPROVE_LOG_PATH:root+'/log/auto-approve-log.ndjson',DAEMON_STOP_PATH:root+'/data/muse-daemon.stop',
+DAEMON_PID_PATH:root+'/data/muse-daemon.pid',COOKIE_PATH:root+'/data/cookies.json'};
+''')
+            (app / 'work/proxy.cjs').write_text('module.exports={installProxy:()=>{},PROXY:null};')
+            (app / 'work/login-lib.cjs').write_text("module.exports={resolveCredentials:()=>({email:'test@example.test',source:'file'})};")
             (app / 'work/muse-rpc.cjs').write_text('''
-module.exports = {rpcCall: async (conn, method, params) => {
- if (process.env.EMPTY_QUEUE && method === 'egress.approvals') return {pending: []};
- if (method === 'egress.approvals') return {pending: [
-   {approval_id:'net', type:'egress', destination_domain:'example.com'},
-   {approval_id:'reader', type:'reader_grant', destination_domain:'example.com'},
-   {approval_id:'command', registered_command:'curl https://example.com', host:'example.com', port:443, scheme:'https'},
-   {approval_id:'command-with-domain', registered_command:'curl', destination_domain:'example.com'},
-   {approval_id:'host-only', host:'example.com', port:443, scheme:'https'},
-   {approval_id:'unknown', description:'please allow example.com'}]};
- return {ok:true};
+const fs=require('fs');
+module.exports={connect:async()=>({ws:{close:()=>{}}}), rpcCall:async(conn,method,params)=>{
+ if(method==='egress.approvals') return {pending:[
+  {approval_id:'host-only',host:'example.test',port:443,scheme:'tcp'},
+  {approval_id:'command',host:'example.test',registered_command:'curl https://example.test'},
+  {approval_id:'fallback',host:'fallback.test'},
+  {approval_id:'opaque'}],pending_approvals:[{approval_id:'host-only'}]};
+ if(method!=='egress.approval.decide') throw Error('unexpected RPC');
+ fs.appendFileSync('data/calls.ndjson',JSON.stringify(params)+'\\n');
+ if(params.approval_id==='fallback' && params.decision==='allow_always') throw Error('scope rejected');
+ return {approval:{status:'approved',applied_rule_entries:[]}};
 }};
 ''')
-            test = stack / 'test.cjs'
-            test.write_text('''
-const assert = require('assert'); const fs = require('fs');
-const adapter = require(process.env.ADAPTER); adapter.install();
-const rpc = require(process.env.AXH_HOME + '/MuseAutoApprove/work/muse-rpc.cjs');
-(async () => {
- const result = await rpc.rpcCall({}, 'egress.approvals', {});
- assert.deepEqual(result.pending.map(x=>x.approval_id), ['net']);
- await assert.rejects(rpc.rpcCall({}, 'egress.approval.decide', {approval_id:'reader'}));
- await assert.rejects(rpc.rpcCall({}, 'egress.approval.decide', {approval_id:'command'}));
- await assert.rejects(rpc.rpcCall({}, 'egress.approval.decide', {approval_id:'command-with-domain'}));
- const file=process.env.AXH_HOME + '/run/maa.coverage.json';
- const initial=JSON.parse(fs.readFileSync(file));
- assert.equal(initial.visible_pending, 6);
- assert.equal(initial.eligible_pending, 1);
- assert.equal(initial.skipped_command, 2);
- assert.equal(initial.decision_rpc_ok, 0);
- await rpc.rpcCall({}, 'egress.approval.decide', {approval_id:'net', decision:'allow_once'});
- assert.equal(JSON.parse(fs.readFileSync(file)).decision_rpc_ok, 1);
- assert(!fs.readFileSync(file, 'utf8').includes('registered_command'));
- assert(fs.existsSync(process.env.AXH_HOME + '/run/maa.ok'));
- console.log('http://user:secret@proxy.test password=verysecret');
- fs.appendFileSync(process.env.AXH_HOME + '/MuseAutoApprove/log/daemon-log.ndjson',
-   '{"proxy":"http://user:secret@proxy.test","password":"verysecret"}');
-})().catch(e=>{console.error(e); process.exit(1)});
-''')
-            result = subprocess.run(['node', str(test)], env={**os.environ, 'AXH_HOME': directory,
-                         'MUSE_VM_ID': 'test-vm', 'ADAPTER': str(ROOT / 'scripts/maa-adapter.cjs')},
-                         capture_output=True, text=True, check=True)
-            output = result.stdout + result.stderr + (app / 'log/daemon-log.ndjson').read_text()
-            self.assertNotIn('secret', output)
-            # A new healthy poller with an empty queue must not report decision success.
-            empty = stack / 'empty.cjs'
-            empty.write_text('''
-const fs=require('fs'); const assert=require('assert');
-require(process.env.ADAPTER).install();
-const rpc=require(process.env.AXH_HOME+'/MuseAutoApprove/work/muse-rpc.cjs');
-(async()=>{
- await rpc.rpcCall({},'egress.approvals',{});
- const state=JSON.parse(fs.readFileSync(process.env.AXH_HOME+'/run/maa.coverage.json'));
- assert.equal(state.polls,1); assert.equal(state.visible_pending,0); assert.equal(state.decision_rpc_ok,0);
- assert.equal(state.command_approvals,'unsupported');
-})().catch(e=>{console.error(e);process.exit(1)});
-''')
-            env = {**os.environ, 'AXH_HOME': directory, 'MUSE_VM_ID': 'test-vm',
-                   'ADAPTER': str(ROOT / 'scripts/maa-adapter.cjs'), 'EMPTY_QUEUE': '1'}
-            subprocess.run(['node', str(empty)], env=env, check=True, capture_output=True)
-            status = subprocess.run(['node', str(ROOT / 'scripts/maa-adapter.cjs'), '--status'], env=env,
-                                    check=True, capture_output=True, text=True).stdout
-            self.assertIn('command approvals unsupported', status)
-            self.assertIn('0 successful', status)
+            result = subprocess.run(['node', str(app / 'muse-daemon.cjs'), '--once'], cwd=app,
+                                    capture_output=True, text=True, check=True)
+            calls = [json.loads(line) for line in (app / 'data/calls.ndjson').read_text().splitlines()]
+            self.assertEqual([c['approval_id'] for c in calls],
+                             ['host-only', 'command', 'fallback', 'fallback', 'opaque'])
+            self.assertEqual(calls[3], {'approval_id': 'fallback', 'decision': 'allow_once'})
+            for c in calls[:3] + calls[4:]:
+                self.assertEqual(c['decision'], 'allow_always')
+                self.assertEqual(c['always_scope'], 'destination_domain')
+                self.assertEqual(c['allow_always_scope'], 'destination_domain')
+            events = [json.loads(line) for line in (app / 'log/daemon-log.ndjson').read_text().splitlines()]
+            self.assertEqual(sum(e['event'] == 'decided' for e in events), 3)
+            self.assertEqual(sum(e['event'] == 'decided_fallback' for e in events), 1)
+            self.assertIn('"decided":4', result.stdout)
+
+    def test_readonly_status_distinguishes_poll_decision_and_current_launch(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('maa_status', ROOT / 'scripts/maa-status.py')
+        status = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(status)
+        with tempfile.TemporaryDirectory() as directory:
+            stack = Path(directory)
+            (stack / 'run').mkdir()
+            log = stack / 'MuseAutoApprove/log/daemon-log.ndjson'
+            log.parent.mkdir(parents=True)
+            now = 1_000_000
+            (stack / 'run/maa.started').write_text(str(now-1000))
+            records = [
+                {'ts':now-2000,'event':'decided','status':'approved'},  # old run
+                {'ts':now-900,'event':'daemon_start','decision':'allow_always','scope':'destination_domain'},
+                {'ts':now-800,'event':'heartbeat','pending':0},
+                {'ts':now-700,'event':'list_error','error':'secret'},
+                {'ts':now+1000,'event':'heartbeat','pending':99}]
+            log.write_text('\n'.join(json.dumps(r) for r in records)+'\n{partial')
+            original = log.read_bytes()
+            state = status.snapshot(stack, now)
+            self.assertTrue(status.healthy(state, now))
+            self.assertEqual(state['decisions'], 0)
+            self.assertEqual(state['pending'], 0)
+            self.assertEqual(state['poll'], now-800)  # error doesn't refresh success
+            self.assertEqual(log.read_bytes(), original)
+            records += [{'ts':now-600,'event':'pending_found','count':2},
+                        {'ts':now-500,'event':'decided','status':'pending'},
+                        {'ts':now-400,'event':'decided_fallback','status':'approved'}]
+            log.write_text('\n'.join(json.dumps(r) for r in records)+'\n')
+            state = status.snapshot(stack, now)
+            self.assertEqual((state['decisions'],state['approved'],state['fallback']), (2,1,1))
+            self.assertEqual(state['pending'], 2)
+            self.assertFalse(status.healthy(state, now+121000))
+            (stack / 'run/maa.started').write_text(str(now))
+            self.assertFalse(status.healthy(status.snapshot(stack, now), now))
+            # Truncated/rotated log, malformed records, bounded tail are tolerated.
+            (stack / 'run/maa.started').write_text(str(now-1000))
+            log.write_text('x'*(status.WINDOW+1)+'\n'+json.dumps(records[2])+'\n{partial')
+            self.assertTrue(status.healthy(status.snapshot(stack, now), now))
+            log.unlink()
+            self.assertFalse(status.healthy(status.snapshot(stack, now), now))
 
 
 if __name__ == '__main__':

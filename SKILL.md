@@ -13,7 +13,7 @@ description: 在 Linux 主机、Muse 沙盒或容器中部署 AxonHub 官方发�
 
 - 正式使用：Cloudflare 中创建 Cloudflared Tunnel，将 Public Hostname 的 service 指向 `http://127.0.0.1:8090`；准备 tunnel token。
 - 临时测试：没有域名/令牌时用 `AXH_MODE=quick`，随机地址可能随重启改变，无 SLA。
-- Muse 部署必须接入 [平台恢复与凭据刷新](references/muse.md)；用户要求自动审批时接入 [MuseAutoApprove](references/muse-auto-approve.md)，只覆盖 sentinel 队列中可识别的网络审批，命令审批另属通道，不能承诺自动处理。
+- Muse 部署必须接入 [平台恢复与凭据刷新](references/muse.md)；用户要求自动审批时接入 [MuseAutoApprove](references/muse-auto-approve.md)，沿用上游默认 allow_always + destination_domain、失败回退单次；不注入自研 schema 过滤，按原生日志和历史核实实际审批。
 - Muse、出站受限、直连失败或报告 `hard_fail=true`：读取 [Muse 代理与重建](references/muse.md)。不要仅根据直连 precheck 断言环境无法部署。
 
 从技能目录执行；升级已有脚本时先用旧脚本 `stop`，再安装新脚本，以便旧监督进程退出：
@@ -95,4 +95,4 @@ Muse 不能以一次公网 200 作为保活验收。需核实新会话定时任�
 
 排障先看 `$AXH_HOME/logs/{axonhub,tunnel,shim,watchdog,axh}.log`：无 cron 不必等待 apt；HTTP/2 仍失败走 Muse 诊断；公网 1033 看 tunnel ready，502 看 origin 路由与本地服务。不要用取消 TLS 校验来掩盖 CONNECT/TLS 失败。
 
-排查业务 407 必须复现实际 AI 请求，跨凭据轮换复测；401 只能证明到达服务商，不能证明对话成功。MAA 的 pending=0/心跳新鲜只证明队列轮询，不代表用户的审批卡片已覆盖；先按 [审批诊断](references/muse-auto-approve.md#审批覆盖与诊断) 区分队列和 schema。
+排查业务 407 必须复现实际 AI 请求，跨凭据轮换复测；401 只能证明到达服务商，不能证明对话成功。MAA 的 pending=0/心跳新鲜只证明队列轮询，不代表用户的审批卡片已覆盖；先按 [审批诊断](references/muse-auto-approve.md#现场复盘与排障边界) 核对同一审批 ID 的原生日志与历史。

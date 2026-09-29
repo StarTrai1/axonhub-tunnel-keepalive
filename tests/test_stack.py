@@ -286,21 +286,27 @@ timeout() { return 1; }
             (app / folder).mkdir(parents=True)
         (app / 'work/muse-rpc.cjs').write_text("module.exports={rpcCall:async()=>({pending:[]})};")
         (app / 'muse-daemon.cjs').write_text('''
-const rpc=require('./work/muse-rpc.cjs');
-setInterval(()=>rpc.rpcCall({}, 'egress.approvals', {}), 100);
+const fs=require('fs');
+fs.writeFileSync(process.env.AXH_HOME+'/run/maa.args', JSON.stringify(process.argv.slice(2)));
+fs.writeFileSync(process.env.AXH_HOME+'/run/maa.execargs', JSON.stringify(process.execArgv));
+fs.writeFileSync(process.env.AXH_HOME+'/run/maa.proxy',process.env.MUSE_PROXY || 'direct');
+setInterval(()=>fs.appendFileSync('log/daemon-log.ndjson',JSON.stringify({ts:Date.now(),event:'heartbeat',pending:0})+'\\n'),100);
 ''')
         (self.stack / 'data/initialized').touch()
         self.call('start')
-        self.wait_for(lambda: (self.stack / 'run/maa.ok').exists())
+        self.wait_for(lambda: self.call('health', check=False).returncode == 0)
         self.assertEqual(self.call('health').stdout.strip(), 'OK')
+        self.assertEqual(json.loads((self.stack / 'run/maa.args').read_text()),
+                         ['--loop','10000','--always','--scope','destination_domain','--fallback-once'])
+        self.assertEqual(json.loads((self.stack / 'run/maa.execargs').read_text()), [])
+        self.assertEqual((self.stack / 'run/maa.proxy').read_text(), 'direct')
         old = self.pid('maa', child=True)
         os.kill(old, signal.SIGKILL)
         self.wait_for(lambda: self.pid('maa', child=True) not in (0, old))
-        self.wait_for(lambda: (self.stack / 'run/maa.ok').exists())
-        os.utime(self.stack / 'run/maa.ok', (0, 0))
+        self.wait_for(lambda: self.call('health', check=False).returncode == 0)
         # Stop polling but leave the process alive: heartbeat freshness matters.
         os.kill(self.pid('maa', child=True), signal.SIGSTOP)
-        os.utime(self.stack / 'run/maa.ok', (0, 0))
+        (app / 'log/daemon-log.ndjson').write_text(json.dumps({'ts': int(time.time()*1000)-121000, 'event':'heartbeat','pending':0})+'\n')
         self.assertIn('maa', self.call('health', check=False).stdout)
         os.kill(self.pid('maa', child=True), signal.SIGCONT)
         (app / 'data/muse-daemon.stop').touch()
@@ -308,6 +314,12 @@ setInterval(()=>rpc.rpcCall({}, 'egress.approvals', {}), 100);
         self.wait_for(lambda: self.pid('maa') == 0)
         self.call('watchdog')
         self.assertEqual(self.pid('maa'), 0)
+        self.env['AXH_MAA_DECISION']='allow_once'
+        (app / 'data/muse-daemon.stop').unlink()
+        self.call('watchdog')
+        self.wait_for(lambda: self.call('health', check=False).returncode == 0)
+        self.assertEqual(json.loads((self.stack / 'run/maa.args').read_text()),
+                         ['--loop','10000','--decision','allow_once','--no-fallback'])
 
     def test_maa_rotation_preserves_healthy_daemon_and_resets_failed_supervisor(self):
         if not shutil.which('node'):
@@ -321,8 +333,7 @@ setInterval(()=>rpc.rpcCall({}, 'egress.approvals', {}), 100);
 const fs=require('fs');
 if (!fs.existsSync(process.env.AXH_HOME+'/data/maa-can-connect')) process.exit(1);
 fs.writeFileSync(process.env.AXH_HOME+'/run/maa.proxy',process.env.MUSE_PROXY);
-const rpc=require('./work/muse-rpc.cjs');
-setInterval(()=>rpc.rpcCall({},'egress.approvals',{}),100);
+setInterval(()=>fs.appendFileSync('log/daemon-log.ndjson',JSON.stringify({ts:Date.now(),event:'heartbeat',pending:0})+'\\n'),100);
 ''')
         (self.stack / 'data/initialized').touch()
         self.call('start')
@@ -331,7 +342,7 @@ setInterval(()=>rpc.rpcCall({},'egress.approvals',{}),100);
         (self.stack / 'data/maa-can-connect').touch()
         self.env['HTTPS_PROXY'] = 'http://fresh:secret@127.0.0.1:4321'
         self.call('set-proxy')
-        self.wait_for(lambda: self.pid('maa') not in (0, supervisor) and (self.stack / 'run/maa.ok').exists(), timeout=5)
+        self.wait_for(lambda: self.pid('maa') not in (0, supervisor) and self.call('health', check=False).returncode == 0, timeout=5)
         self.assertEqual((self.stack / 'run/maa.proxy').read_text(), 'http://127.0.0.1:' + self.env['AXH_PROXY_LOCAL_PORT'])
         supervisor, child = self.pid('maa'), self.pid('maa', child=True)
         self.env['HTTPS_PROXY'] = 'http://newer:secret@127.0.0.1:4321'
