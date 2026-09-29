@@ -80,7 +80,7 @@ class StackTests(unittest.TestCase):
 
     def tearDown(self):
         self.call('stop', check=False)
-        for name in ('watchdog-loop', 'axonhub', 'tunnel', 'shim'):
+        for name in ('watchdog-loop', 'axonhub', 'tunnel', 'shim', 'maa'):
             pid = self.pid(name)
             try:
                 if pid and str(self.stack).encode() in Path(f'/proc/{pid}/cmdline').read_bytes():
@@ -129,7 +129,7 @@ class StackTests(unittest.TestCase):
     def test_proxy_persistence_refresh_and_permissions(self):
         self.env['HTTPS_PROXY'] = 'http://fake-user:fake-pass@127.0.0.1:3128'
         result = self.call('set-proxy')
-        path = self.stack / 'proxy.env'
+        path = self.stack / 'proxy.json'
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertNotIn('fake-pass', result.stdout + result.stderr)
         self.env['HTTPS_PROXY'] = 'http://new-user:new-pass@127.0.0.1:3129'
@@ -206,6 +206,99 @@ timeout() { return 1; }
         self.call('restore')
         self.wait_for(lambda: self.pid('watchdog-loop'))
         self.assertEqual(self.call('health').stdout.strip(), 'OK')
+
+    def test_session_recovery_after_all_processes_lost_preserves_named_tunnel(self):
+        (self.stack / 'data/initialized').write_text('retained-owner')
+        (self.stack / 'tunnel.token').write_text('retained-token')
+        self.env['AXH_HOSTNAME'] = 'example.invalid'
+        self.env['AXH_PLATFORM_REQUIRED'] = '1'
+        self.call('session-restore')
+        old = {}
+        # Reproduce VM process loss without rebooting the test host.
+        for name in ('watchdog-loop', 'axonhub', 'tunnel'):
+            for child in (False, True):
+                pid = self.pid(name, child)
+                if pid:
+                    old[(name, child)] = pid
+                    os.kill(pid, signal.SIGKILL)
+        time.sleep(.2)
+        self.assertEqual(self.call('health', check=False).returncode, 1)
+        self.call('session-restore')
+        self.assertEqual(self.call('health').stdout.strip(), 'OK')
+        self.assertNotEqual(self.pid('watchdog-loop'), old[('watchdog-loop', False)])
+        self.assertEqual((self.stack / 'data/initialized').read_text(), 'retained-owner')
+        self.assertEqual((self.stack / 'tunnel.token').read_text(), 'retained-token')
+        args = json.loads((self.stack / 'run/tunnel.args').read_text())
+        self.assertIn('--token-file', args)
+        self.assertNotIn('--url', args)
+        self.call('stop')
+        self.assertIn('MAINTENANCE', self.call('session-restore').stdout)
+        self.assertEqual(self.pid('axonhub'), 0)
+
+    def test_named_token_missing_never_becomes_quick(self):
+        (self.stack / 'data/initialized').touch()
+        self.env['AXH_HOSTNAME'] = 'example.invalid'
+        self.call('start')
+        result = self.call('health', check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('token-missing', result.stdout)
+        self.assertFalse((self.stack / 'run/tunnel.args').exists())
+
+    def test_set_proxy_requires_fresh_input_and_corrupt_state_is_repairable(self):
+        self.call('set-proxy')
+        original = (self.stack / 'proxy.json').read_bytes()
+        for name in ('HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'AXH_EDGE_PROXY'):
+            self.env.pop(name, None)
+        self.assertEqual(self.call('set-proxy', check=False).returncode, 2)
+        self.assertEqual((self.stack / 'proxy.json').read_bytes(), original)
+        (self.stack / 'proxy.json').write_text('invalid')
+        self.env['HTTPS_PROXY'] = 'http://fresh:secret@localhost:3456'
+        self.call('set-proxy')
+        self.assertEqual(json.loads((self.stack / 'proxy.json').read_text())['url'], self.env['HTTPS_PROXY'])
+
+    def test_platform_and_watchdog_staleness_are_not_healthy(self):
+        (self.stack / 'data/initialized').touch()
+        self.call('restore')
+        self.wait_for(lambda: (self.stack / 'run/watchdog.tick').exists())
+        self.env['AXH_PLATFORM_REQUIRED'] = '1'
+        self.assertIn('platform-stale', self.call('health', check=False).stdout)
+        self.call('session-restore')
+        self.assertEqual(self.call('health').stdout.strip(), 'OK')
+        old = time.time() - 240
+        os.utime(self.stack / 'run/watchdog.tick', (old, old))
+        self.assertIn('watchdog-stale', self.call('health', check=False).stdout)
+
+    def test_maa_supervision_heartbeat_and_stop_marker(self):
+        if not shutil.which('node'):
+            self.skipTest('Node required')
+        self.env.update(AXH_MAA_ENABLED='1', MUSE_VM_ID='test-vm', AXH_NODE_BIN=shutil.which('node'))
+        app = self.stack / 'MuseAutoApprove'
+        for folder in ('work', 'data', 'log'):
+            (app / folder).mkdir(parents=True)
+        (app / 'work/muse-rpc.cjs').write_text("module.exports={rpcCall:async()=>({pending:[]})};")
+        (app / 'muse-daemon.cjs').write_text('''
+const rpc=require('./work/muse-rpc.cjs');
+setInterval(()=>rpc.rpcCall({}, 'egress.approvals', {}), 100);
+''')
+        (self.stack / 'data/initialized').touch()
+        self.call('start')
+        self.wait_for(lambda: (self.stack / 'run/maa.ok').exists())
+        self.assertEqual(self.call('health').stdout.strip(), 'OK')
+        old = self.pid('maa', child=True)
+        os.kill(old, signal.SIGKILL)
+        self.wait_for(lambda: self.pid('maa', child=True) not in (0, old))
+        self.wait_for(lambda: (self.stack / 'run/maa.ok').exists())
+        os.utime(self.stack / 'run/maa.ok', (0, 0))
+        # Stop polling but leave the process alive: heartbeat freshness matters.
+        os.kill(self.pid('maa', child=True), signal.SIGSTOP)
+        os.utime(self.stack / 'run/maa.ok', (0, 0))
+        self.assertIn('maa', self.call('health', check=False).stdout)
+        os.kill(self.pid('maa', child=True), signal.SIGCONT)
+        (app / 'data/muse-daemon.stop').touch()
+        os.kill(self.pid('maa', child=True), signal.SIGTERM)
+        self.wait_for(lambda: self.pid('maa') == 0)
+        self.call('watchdog')
+        self.assertEqual(self.pid('maa'), 0)
 
 
 if __name__ == '__main__':

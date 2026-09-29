@@ -18,7 +18,7 @@ cloudflared --protocol http2 --edge 127.0.0.1:7844
 ## 部署或修复已有实例
 
 1. 保留已有 `data/`、`env`、`tunnel.token`。用旧 `axh.sh stop` 停止旧监督器；若之前人工装过 `watchdog-loop.sh`，核实其 pidfile/cmdline 后终止旧循环并移除它的重复启动入口，避免新旧两套同时巡检。
-2. 从新技能目录执行 `AXH_HOME="$HOME/axonhub-stack" bash scripts/axh.sh install`。必须一起安装三个脚本；恢复不依赖 `/etc/cloudflared` 中遗留的文件。
+2. 从新技能目录执行 `AXH_HOME="$HOME/axonhub-stack" bash scripts/axh.sh install`。必须从完整技能目录安装全部辅助脚本；恢复不依赖 `/etc/cloudflared` 中遗留的文件。
 3. 利用平台已经提供的 `HTTPS_PROXY`（也支持小写，HTTP_PROXY 或显式 AXH_EDGE_PROXY）：
 
 ```bash
@@ -28,7 +28,7 @@ bash "$AXH_HOME/axh.sh" set-proxy
 bash "$AXH_HOME/axh.sh" doctor
 ```
 
-`set-proxy` 将选定地址以 shell 安全引用写到权限 600 的 `proxy.env`，不回显凭据；cron/systemd 可重新读取。平台轮换代理地址或认证后，从新环境再次执行 set-proxy，再 stop/start。不要把真实代理地址、token 或 owner 密码提交到 Git。
+`set-proxy` 从调用脚本前的环境取值，原子保存到权限 600 的 `proxy.json`；旧 proxy.env 仅作迁移兼容。shim 每次 CONNECT 重读文件，不再使用常驻进程启动时的旧密码。没有本轮输入时返回 2，不把旧文件重新标记成新凭据。文件时间仅证明接收时间，不能证明平台代理签发/到期时间。不要把真实代理地址、token 或 owner 密码提交到 Git。
 
 4. doctor 通过后执行 `start`、`boot`、`status`。已初始化的 owner 不要重建；没有 crontab 时 boot 自动启用 60 秒循环，不调用 apt-get。以 `run/watchdog.tick` 的时间推进证明它实际在跑。
 5. 检查 `/ready` 和公网 `https://<实际域名>/health`。未通过时只能报告“已配置代理路径、尚未连通”，不能报告部署成功。
@@ -54,18 +54,40 @@ doctor 模仿 cloudflared 的 HTTP/2 TLS 设置：验证证书与 `h2.cftunnel.c
 
 如果代理端的域名解析也有问题，可在 env 中设置 `AXH_EDGE_TARGETS=<当前官方 region1 IP>,<当前官方 region2 IP>`，逗号分隔、**不带端口**。先核对 Cloudflare 当前地址表并确认代理允许 IP CONNECT；不要把社区旧 IP 永久硬编码。shim 始终连接目标 7844，TLS SNI/证书校验不变。
 
-## 沙盒重建后的第三层恢复
+## 新会话刷新 + VM 重建恢复（部署必须完成）
 
-所有脚本、程序、数据和敏感配置保存在 `$AXH_HOME`。`restore` 可重建本地监督器、看门狗、可用的 cron/systemd 开机入口；proxy-ns 的 hosts overlay 会在下一次隧道启动时重建。不调用 `cloudflared service install`，因而不依赖社区提到的 `/etc/cloudflared` 清理行为，也不用搬运系统目录中的 token。
+本地 watchdog 的子进程只继承旧环境，重启 shim 也不会产生新密码。外部恢复不能只在 `health` 失败时运行：隧道仍健康时也要接收新会话凭据，供下一次重连使用。
 
-平台侧配置两个外部触发，使用部署时确定的**绝对路径和用户身份**，避免平台 root HOME 指向另一个目录：
+在新平台 exec 中执行（替换成实际绝对持久路径）：
 
-- 开机钩子：`AXH_HOME=/实际持久路径/axonhub-stack bash /实际持久路径/axonhub-stack/axh.sh restore`。
-- 每分钟外部巡检：运行同一路径的 `health`；0 静默，1 执行一次 restore 后再次检查并报告持续失败，2 保留诊断而不盲目重装。平台必须避免同一轮无限重试。
+```bash
+AXH_HOME=/实际持久路径/axonhub-stack bash /实际持久路径/axonhub-stack/axh.sh session-restore
+```
 
-若当前 Muse 提供 `home-init`/`init.sh` 或平台定时任务接口，读取已有配置后合并入口，保留其他任务；不要直接覆盖现有 init.sh，也不要猜测平台 API。平台配置需要其实际授权时按界面完成；没有此能力时提供上述准确命令并标明“整机重建自动恢复未接入”。外部巡检能恢复丢失的看门狗循环；本地循环自身不能抵抗全部进程被回收。
+`session-restore` 顺序：尊重维护标记 → 单实例 → 记录本轮 exec/boot ID → 保存新环境代理 → 检查服务 → 必要时 restore/watchdog → 对未 ready 的 tunnel 进行一次有界重启和复查。正常长连接不因密码变化被杀；MAA 使用 edge 代理时单独重新加载。固定域名存在却缺 token 会报错，绝不自动切 Quick Tunnel。
 
-这些机制是服务自恢复，不是让平台永不休眠的保证。本技能不安装无关探针、Hermes、SSH 或自动审批工具。
+**只能由新平台会话调用。** 不先 source stack/env、proxy.env，也不要从旧终端、旧 watchdog、旧 supervisor 调用来伪装新环境。优先读取本轮 exec 注入的 HTTPS_PROXY；如果平台根本不提供新值，明确报告 `NEEDS_FRESH_PROXY`，不能声称凭据已经续期。自动审批登录 token、CF tunnel token 和 egress proxy 密码是三种不同凭据。
+
+### 平台钩子与定时任务
+
+参照社区已展示的 Muse hooks 格式，使用独立 ID `axonhub-session-recovery`，不覆盖已有 home-init/init.sh：
+
+1. 用平台工具确认实际的 hooks/definitions、hooks/scripts 目录、hook runtime 协议及注册权限；通常在 `/home/hatch/hooks`，不能仅靠猜路径新建目录后声称已注册。
+2. 执行 `bash "$AXH_HOME/axh.sh" muse-hooks /实际/hooks`。它写专用 JSON 和 launcher，使用 `HATCH_HOOK_RUNTIME` 的 silent/wake；每 60 秒检测，首次启动、健康失败或新会话记录过期时 wake 平台 Agent。**该钩子不读取自己的旧代理作为新凭据，也不在沙盒内循环模拟平台调度。**
+3. 通过当前平台实际提供的任务接口，创建/更新每分钟任务 `axonhub-session-recovery`，内容采用生成的 `$AXH_HOME/platform-task.txt`；禁止重叠，最多执行一轮有界恢复。不要把生成 txt 当作已创建平台任务，也不要仅向未知目录写 Markdown 冒充任务 API。
+4. 平台新 Agent 收到唤醒或任务后，必须发起全新的 exec，调用 session-restore。0 健康/维护静默；1 报告脱敏失败证据，不在本轮无限重试；2 新凭据或环境不可用，下轮再试，连续三轮报告。恢复后从平台新会话访问正式域名的 HTTPS /health。
+5. 编辑 env 加 `AXH_PLATFORM_REQUIRED=1`；验证任务/钩子启用、至少两个真实平台运行记录、`run/session.tick` 持续更新与 `session.boot` 对应当前 boot ID。hook/任务存在但无执行记录，只能报告已配置未验收。
+
+若平台只提供开机 init.sh，保留既有逻辑并合并恢复入口；启动钩子可先运行本地 restore，但**仍需要每分钟的新会话任务更新代理**。缺少平台能力或授权时提供生成文件和实际缺口；不要退回“nohup 在跑所以永久保活成功”。本地检查器不能让平台在它被杀后自行启动。
+
+### 验证故障闭环
+
+- 在测试环境中终止这套应用的全部已核实进程，让平台任务恢复，检查 owner/data/token/正式域名不变；不是重启宿主机，不碰其他应用。
+- 用两个不泄露的凭据版本验证新会话写入后，已运行 shim 的新 CONNECT 使用新值，同时既有连接保持。
+- 真实 VM 重启/重建需当前部署授权和平台运行记录；没有实际重建过就分开报告，不把模拟进程全灭等同于重建验收。
+- 保存脱敏证据：boot ID、uptime、最后完成的 watchdog tick、新会话 tick、CONNECT 状态、/ready、公网 /health。TLS EOF 单独不能证明密码到期，代理 407/新旧凭据对照才更有指向性。
+
+这些机制是重建后恢复，不会阻止平台回收。`data/`、全部脚本、二进制、proxy.json、tunnel.token、MAA 的 data/node_modules/lockfile 均须持久化；无持久盘要先有数据备份。MuseAutoApprove 按 [专用说明](muse-auto-approve.md) 接入；不安装无关探针、Hermes 或 SSH。
 
 ## 依据
 

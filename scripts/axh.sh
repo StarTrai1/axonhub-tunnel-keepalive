@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # axh.sh — AxonHub + Cloudflare Tunnel：安装 / 保活 / 恢复（幂等）
-# 用法: axh.sh install | set-token | set-proxy | doctor | start | stop | status | health | boot | restore | upgrade
+# 用法: axh.sh install | set-token | set-proxy | doctor | start | stop | status | health | boot | restore | session-restore | muse-hooks DIR | maa-install | upgrade
 # 所有状态都在 $AXH_HOME（默认 ~/axonhub-stack），把它放在持久盘上。
 set -u
 umask 077
@@ -8,16 +8,29 @@ AXH_USER_HOME="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}"
 export AXH_HOME="${AXH_HOME:-$AXH_USER_HOME/axonhub-stack}"
 mkdir -p "$AXH_HOME"/{bin,data,run,logs,cache} && chmod 700 "$AXH_HOME"
 ENV_FILE="$AXH_HOME/env"
-AXH_PROXY_INPUT="${AXH_EDGE_PROXY:-${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}}"
+export AXH_PROXY_INPUT="${AXH_EDGE_PROXY:-${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}}"
 [ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }
-[ -f "$AXH_HOME/proxy.env" ] && { set -a; . "$AXH_HOME/proxy.env"; set +a; }
-if [[ "${AXH_CF_TRANSPORT:-direct}" = proxy* ]] && [ -n "${AXH_EDGE_PROXY:-}" ]; then
-  export HTTPS_PROXY="$AXH_EDGE_PROXY" HTTP_PROXY="$AXH_EDGE_PROXY"
-  export https_proxy="$AXH_EDGE_PROXY" http_proxy="$AXH_EDGE_PROXY"
+load_proxy() {
+  local assignment
+  if [ -f "$AXH_HOME/proxy.json" ]; then
+    assignment=$(python3 "$AXH_HOME/axh_proxy.py" shell) || return 2
+    eval "$assignment"  # Our own helper quotes the value with shlex.quote.
+  elif [ -f "$AXH_HOME/proxy.env" ]; then
+    set -a; . "$AXH_HOME/proxy.env"; set +a  # Previous-release compatibility.
+  fi
+  if [[ "${AXH_CF_TRANSPORT:-direct}" = proxy* ]] && [ -n "${AXH_EDGE_PROXY:-}" ]; then
+    export HTTPS_PROXY="$AXH_EDGE_PROXY" HTTP_PROXY="$AXH_EDGE_PROXY"
+    export https_proxy="$AXH_EDGE_PROXY" http_proxy="$AXH_EDGE_PROXY"
+  fi
+  return 0
+}
+if ! load_proxy; then
+  case "${1:-}" in set-proxy|session-restore|stop) ;; *) exit 2;; esac
 fi
 PORT="${AXH_PORT:-8090}"; MPORT="${AXH_METRICS_PORT:-20241}"
 BIN="$AXH_HOME/bin"; DATA="$AXH_HOME/data"; RUN="$AXH_HOME/run"; LOGS="$AXH_HOME/logs"; CACHE="$AXH_HOME/cache"
 TOKEN_FILE="$AXH_HOME/tunnel.token"; SELF="$AXH_HOME/axh.sh"
+MAA="$AXH_HOME/MuseAutoApprove"
 export PATH="$AXH_USER_HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 log() { echo "[$(date '+%F %T')] $*" >> "$LOGS/axh.log"; }
@@ -28,7 +41,7 @@ L() { echo "http://127.0.0.1:$1"; }
 is_ours() { [ -n "${1:-}" ] && [ -r "/proc/$1/cmdline" ] && tr '\0' ' ' < "/proc/$1/cmdline" | grep -qF -- "$2"; }
 sup_pid() { cat "$RUN/$1.lock/pid" 2>/dev/null; }
 sup_alive() { is_ours "$(sup_pid "$1")" "axh.sh supervise $1"; }
-child_match() { case "$1" in axonhub) echo "$BIN/axonhub";; tunnel) echo "$BIN/cloudflared";; shim) echo "$AXH_HOME/cloudflared-edge-shim.py";; esac; }
+child_match() { case "$1" in axonhub) echo "$BIN/axonhub";; tunnel) echo "$BIN/cloudflared";; shim) echo "$AXH_HOME/cloudflared-edge-shim.py";; maa) echo "$MAA/muse-daemon.cjs";; esac; }
 kill_child() {  # 只杀校验过的子进程；僵尸 cmdline 为空，自然判定为已退出
   local n=$1 p m i; p=$(cat "$RUN/$n.child" 2>/dev/null); m=$(child_match "$n")
   is_ours "$p" "$m" || return 0
@@ -56,12 +69,31 @@ lock_acquire() {  # $1=锁名 $2=cmdline 特征
 # ---------- 被监督的服务 ----------
 proxy_mode() { [[ "${AXH_CF_TRANSPORT:-direct}" = proxy || "${AXH_CF_TRANSPORT:-direct}" = proxy-ns ]]; }
 run_shim() { exec python3 "$AXH_HOME/cloudflared-edge-shim.py"; }
+maa_wanted() { [ "${AXH_MAA_ENABLED:-0}" = 1 ] && [ ! -e "$MAA/data/muse-daemon.stop" ]; }
+run_maa() {
+  local old args=(--loop 10000 --decision allow_once --no-fallback)
+  [ -f "$MAA/muse-daemon.cjs" ] || die "run maa-install first"
+  old=$(cat "$MAA/data/muse-daemon.pid" 2>/dev/null)
+  if is_ours "$old" "$MAA/muse-daemon.cjs"; then die "existing MuseAutoApprove: stop previous launcher before adopting"; fi
+  rm -f "$MAA/data/muse-daemon.pid" "$RUN/maa.ok"
+  case "${AXH_MAA_DECISION:-allow_once}" in
+    allow_once) ;;
+    allow_always) args=(--loop 10000 --always --scope destination_domain --fallback-once);;
+    *) die "AXH_MAA_DECISION must be allow_once or allow_always";;
+  esac
+  load_proxy || return 2
+  if [ "${AXH_MAA_PROXY:-direct}" = edge ]; then export MUSE_PROXY="${AXH_EDGE_PROXY:-}"; fi
+  cd "$MAA" || return 1
+  exec "${AXH_NODE_BIN:-node}" --require "$AXH_HOME/maa-adapter.cjs" "$MAA/muse-daemon.cjs" "${args[@]}"
+}
 run_axonhub() {
   cd "$DATA" || exit 1   # axonhub 默认在 cwd 建 sqlite 库
   export AXONHUB_SERVER_HOST="${AXONHUB_SERVER_HOST:-127.0.0.1}" AXONHUB_SERVER_PORT="$PORT"
   exec "$BIN/axonhub"
 }
 run_tunnel() {
+  load_proxy || return 2
+  if [ -n "${AXH_HOSTNAME:-}" ] && [ ! -s "$TOKEN_FILE" ]; then die "named hostname configured but tunnel token missing; refusing quick fallback"; fi
   local c=(tunnel --no-autoupdate --metrics "127.0.0.1:$MPORT" --protocol "${AXH_CF_PROTOCOL:-auto}")
   if proxy_mode; then
     # Explicit loopback edge avoids DNS and privileged mounts. TLS/SNI remain
@@ -78,18 +110,19 @@ run_tunnel() {
   if [ "${AXH_CF_TRANSPORT:-}" = proxy-ns ]; then exec bash "$AXH_HOME/cloudflared-ns.sh" "$BIN/cloudflared" "${c[@]}"
   else exec "$BIN/cloudflared" "${c[@]}"; fi
 }
-tunnel_wanted() { [ -s "$TOKEN_FILE" ] || [ "${AXH_MODE:-}" = quick ]; }
+tunnel_wanted() { [ -s "$TOKEN_FILE" ] || [ "${AXH_MODE:-}" = quick ] || [ -n "${AXH_HOSTNAME:-}" ]; }
 initialized() { curl --noproxy '*' -fs -m 5 "$(L "$PORT")/admin/system/status" 2>/dev/null | grep -q '"isInitialized"[[:space:]]*:[[:space:]]*true'; }
 tunnel_allowed() { tunnel_wanted && { initialized || [ "${AXH_ALLOW_UNINIT:-0}" = 1 ]; }; }
 
 supervise() {  # 前台重启循环；崩溃退避，运行 ≥30s 才算稳定
   local n=$1 up start rc fails=0 sleeper=""
-  case "$n" in axonhub|tunnel|shim) ;; *) die "unknown service $n";; esac
+  case "$n" in axonhub|tunnel|shim|maa) ;; *) die "unknown service $n";; esac
   lock_acquire "$n" "axh.sh supervise $n" || { echo "$n supervisor already running"; exit 0; }
   trap '[ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null; kill_child "$n"; lock_release "$n"; exit 0' TERM INT
-  trap 'lock_release "$n"' EXIT
+  trap "lock_release $n" EXIT  # Capture validated name; function-local n vanishes on return.
   log "$n supervisor up (pid $$)"
   while [ "$(sup_pid "$n")" = "$$" ] && [ ! -e "$RUN/maintenance" ]; do
+    [ "$n" != maa ] || maa_wanted || break
     kill_child "$n"                       # 清孤儿，否则新进程会因端口被占而反复失败
     start=$(date +%s)
     "run_$n" >> "$LOGS/$n.log" 2>&1 &     # 子进程放后台再 wait，trap 才能及时响应
@@ -109,6 +142,7 @@ start_sup() {
 }
 ensure() {  # 拉起缺失的 supervisor；未初始化的实例不经隧道暴露（/system/initialize 无鉴权，先到先得）
   [ -e "$RUN/maintenance" ] && return 0
+  if maa_wanted; then start_sup maa; fi
   start_sup axonhub
   if tunnel_allowed; then
     if proxy_mode; then start_sup shim; fi
@@ -118,12 +152,18 @@ ensure() {  # 拉起缺失的 supervisor；未初始化的实例不经隧道暴�
 check() {  # 打印不健康的组件名；全部健康返回 0。"进程活着"不等于"服务活着"
   local bad=""
   curl --noproxy '*' -fs -m 5 "$(L "$PORT")/health" >/dev/null 2>&1 || bad="$bad axonhub"
+  if tunnel_wanted && ! initialized && [ "${AXH_ALLOW_UNINIT:-0}" != 1 ]; then bad="$bad initialization"; fi
+  if [ -n "${AXH_HOSTNAME:-}" ] && [ ! -s "$TOKEN_FILE" ]; then bad="$bad token-missing"; fi
+  if maa_wanted; then
+    if ! is_ours "$(cat "$RUN/maa.child" 2>/dev/null)" "$(child_match maa)" || ! recent "$RUN/maa.ok" 120; then bad="$bad maa"; fi
+  fi
   if tunnel_allowed; then
     if proxy_mode; then is_ours "$(cat "$RUN/shim.child" 2>/dev/null)" "$(child_match shim)" || bad="$bad shim"; fi
     curl --noproxy '*' -fs -m 5 "$(L "$MPORT")/ready" >/dev/null 2>&1 || bad="$bad tunnel"
   fi   # /ready = 已连上 CF 边缘，CONNECT 200 或 quick URL 都不能替代它
   echo "${bad# }"; [ -z "$bad" ]
 }
+recent() { local stamp; stamp=$(stat -c %Y "$1" 2>/dev/null) || return 1; [ $(( $(date +%s) - stamp )) -le "$2" ]; }
 wait_health() { local i; for i in $(seq 1 "${1:-60}"); do curl --noproxy '*' -fs -m 3 "$(L "$PORT")/health" >/dev/null 2>&1 && return 0; sleep 1; done; return 1; }
 rotate() {  # 原地截断，不 mv：supervisor 持有的 O_APPEND fd 仍然有效
   local f; for f in "$LOGS"/*.log; do [ -f "$f" ] && [ "$(stat -c %s "$f")" -gt 5242880 ] \
@@ -135,7 +175,7 @@ cmd_install() {
   command -v curl >/dev/null || die "need curl"
   local src helper
   src=$(cd "$(dirname "$0")" && pwd)
-  for helper in cloudflared-edge-shim.py cloudflared-ns.sh; do
+  for helper in cloudflared-edge-shim.py cloudflared-ns.sh axh_proxy.py maa-adapter.cjs maa-install.sh muse-hooks.py muse-hook.sh; do
     [ -f "$src/$helper" ] || die "missing $src/$helper; copy all scripts together"
     if [ "$src" != "$AXH_HOME" ]; then
       install -m700 "$src/$helper" "$AXH_HOME/$helper.new" && mv -f "$AXH_HOME/$helper.new" "$AXH_HOME/$helper" || die "cannot install $helper"
@@ -169,7 +209,13 @@ cmd_install() {
   [ -f "$ENV_FILE" ] || { cat > "$ENV_FILE" <<'E'
 # 按需取消注释。AXONHUB_* 会原样传给 axonhub（键名 = 配置路径大写、点换下划线）。
 # AXH_HOSTNAME=axonhub.example.com            # 隧道公开主机名，status 用它做公网 HTTPS 自检
-# AXH_MODE=quick                              # 无域名/令牌的临时方案：随机 trycloudflare.com 地址，重启即变
+# AXH_MODE=quick                              # 无域名/令牌的临时方案，固定域名存在时不回退
+# AXH_PLATFORM_REQUIRED=1                    # Muse: health 必须看到近期平台新会话执行记录
+# AXH_MAA_ENABLED=1                          # maa-install + 凭据/当前 MUSE_VM_ID 就绪后启用
+# AXH_MAA_DECISION=allow_once                 # 可选 allow_always：按域名永久允许
+# MUSE_VM_ID=...                              # 当前 VM ID，重建后核实
+# AXH_NODE_BIN=/absolute/path/to/node         # Node 22+，重建后仍存在的路径
+# AXH_MAA_PROXY=edge                         # 默认直连；需要平台代理才设置 edge
 # AXH_CF_PROTOCOL=http2                       # UDP 7844 被封时改 http2（走 TCP 7844）
 # AXH_CF_TRANSPORT=proxy                      # Muse: HTTP/2 + CONNECT shim，无需 mount 权限
 # AXH_CF_TRANSPORT=proxy-ns                   # 可选：社区 hosts + mount namespace 路径
@@ -188,13 +234,12 @@ cmd_set_token() {  # 从 stdin 读：可直接粘贴 Cloudflare 面板的整条 
 }
 cmd_set_proxy() {
   command -v python3 >/dev/null || die "proxy transport needs Python 3.11+"
-  # Persist only the selected proxy so cron/systemd do not lose the shell env.
-  local proxy="${AXH_PROXY_INPUT:-${AXH_EDGE_PROXY:-}}"
-  [ -n "$proxy" ] || die "set AXH_EDGE_PROXY or HTTPS_PROXY before set-proxy"
-  AXH_EDGE_PROXY="$proxy" python3 "$AXH_HOME/cloudflared-edge-shim.py" --validate || return 1
-  ( umask 077; printf 'AXH_EDGE_PROXY=%q\n' "$proxy" > "$AXH_HOME/proxy.env.new" ) &&
-    mv -f "$AXH_HOME/proxy.env.new" "$AXH_HOME/proxy.env" || return 1
-  echo "proxy saved (mode 600); set AXH_CF_TRANSPORT=proxy in env, then run doctor"
+  local result
+  [ -n "$AXH_PROXY_INPUT" ] || { echo "fresh session proxy missing; saved credentials were not re-stamped" >&2; return 2; }
+  result=$(python3 "$AXH_HOME/axh_proxy.py" save) || return 2
+  load_proxy || return 2
+  if [ "$result" = 'proxy updated' ] && [ "${AXH_MAA_PROXY:-direct}" = edge ]; then kill_child maa; fi
+  echo "$result (mode 600; new CONNECTs reload it; existing tunnels preserved)"
 }
 cmd_doctor() {
   command -v python3 >/dev/null || die "proxy transport needs Python 3.11+"
@@ -215,9 +260,9 @@ cmd_start() {
 }
 cmd_stop() {
   local n p i; touch "$RUN/maintenance"   # 维护模式：watchdog 不再拉起
-  for n in tunnel shim axonhub; do p=$(sup_pid "$n"); is_ours "$p" "axh.sh supervise $n" && kill -TERM "$p"; done
-  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do sup_alive axonhub || sup_alive tunnel || sup_alive shim || break; sleep 1; done
-  kill_child tunnel; kill_child shim; kill_child axonhub; echo "stopped (maintenance mode; 'start' to resume)"
+  for n in tunnel shim axonhub maa; do p=$(sup_pid "$n"); is_ours "$p" "axh.sh supervise $n" && kill -TERM "$p"; done
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do sup_alive axonhub || sup_alive tunnel || sup_alive shim || sup_alive maa || break; sleep 1; done
+  kill_child tunnel; kill_child shim; kill_child axonhub; kill_child maa; echo "stopped (maintenance mode; 'start' to resume)"
 }
 cmd_status() {
   local n u
@@ -226,13 +271,17 @@ cmd_status() {
   if proxy_mode; then echo "shim      supervisor: $(sup_alive shim && echo up || echo down)"; fi
   echo "watchdog  backend  : $(cat "$RUN/watchdog.backend" 2>/dev/null || echo '<not installed>')"
   echo "watchdog  last tick: $(cat "$RUN/watchdog.tick" 2>/dev/null || echo '<none>')"
+  echo "platform last exec: $(cat "$RUN/session.tick" 2>/dev/null || echo '<not observed>')"
+  echo "boot id           : $(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
+  if proxy_mode; then python3 "$AXH_HOME/axh_proxy.py" status; fi
+  if maa_wanted; then echo "MAA successful poll: $(recent "$RUN/maa.ok" 120 && echo recent || echo MISSING/STALE)"; fi
   echo "axonhub   health    : $(curl --noproxy '*' -fs -m 5 "$(L "$PORT")/health" >/dev/null 2>&1 && echo ok || echo FAIL)"
   echo "axonhub   initialized: $(initialized && echo yes || echo NO)"
   if tunnel_wanted; then
-    echo "tunnel    mode      : $([ -s "$TOKEN_FILE" ] && echo named || echo quick)"
+    echo "tunnel    mode      : $([ -s "$TOKEN_FILE" ] && echo named || { [ -n "${AXH_HOSTNAME:-}" ] && echo 'named (token missing)' || echo quick; })"
     echo "tunnel    ready     : $(curl --noproxy '*' -fs -m 5 "$(L "$MPORT")/ready" >/dev/null 2>&1 && echo yes || echo NO)"
     u=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$LOGS/tunnel.log" 2>/dev/null | grep -v '^https://api\.' | tail -1)
-    [ -s "$TOKEN_FILE" ] || echo "tunnel    url       : ${u:-<pending>}"
+    if [ ! -s "$TOKEN_FILE" ] && [ -z "${AXH_HOSTNAME:-}" ]; then echo "tunnel    url       : ${u:-<pending>}"; fi
     [ -n "${AXH_HOSTNAME:-}" ] && echo "public    https     : $(curl -fs -m 10 "https://$AXH_HOSTNAME/health" >/dev/null 2>&1 && echo ok || echo FAIL) (https://$AXH_HOSTNAME)"
   else echo "tunnel    : not configured (run set-token, or AXH_MODE=quick in env)"; fi
   return 0
@@ -245,18 +294,19 @@ cmd_health() {  # 退出码即契约：0 健康 / 1 需要恢复 / 2 无法判�
   backend=$(cat "$RUN/watchdog.backend" 2>/dev/null)
   if [ "$backend" = loop ] && ! loop_alive; then bad="$bad watchdog-loop"; fi
   if [ "$backend" = cron ] && ! pgrep -x cron >/dev/null && ! pgrep -x crond >/dev/null; then bad="$bad cron"; fi
+  if [ -n "$backend" ] && ! recent "$RUN/watchdog.tick" 180; then bad="$bad watchdog-stale"; fi
+  if [ "${AXH_PLATFORM_REQUIRED:-0}" = 1 ] && ! recent "$RUN/session.tick" 180; then bad="$bad platform-stale"; fi
   [ -n "$bad" ] || { echo OK; exit 0; }
   echo "DEGRADED: $bad"; exit 1
 }
 cmd_watchdog() {  # cron 每分钟：单实例 → 补装 → 拉起缺失 supervisor → 连续 3 次不健康则杀子进程重启
   [ -e "$RUN/maintenance" ] && exit 0
   lock_acquire watchdog "axh.sh watchdog" || exit 0; trap 'lock_release watchdog' EXIT
-  date -Is > "$RUN/watchdog.tick"
   rotate
   [ -x "$BIN/axonhub" ] && [ -x "$BIN/cloudflared" ] || { log "binaries missing, reinstalling"; cmd_install >> "$LOGS/axh.log" 2>&1; }
   ensure
   local bad n c; bad=" $(check) "
-  for n in axonhub tunnel shim; do
+  for n in axonhub tunnel shim maa; do
     case "$bad" in
       *" $n "*) c=$(( $(cat "$RUN/$n.bad" 2>/dev/null || echo 0) + 1 )); echo "$c" > "$RUN/$n.bad"; log "$n unhealthy ($c)"
                 if [ "$c" -ge 3 ] && sup_alive "$n"; then
@@ -267,6 +317,7 @@ cmd_watchdog() {  # cron 每分钟：单实例 → 补装 → 拉起缺失 super
       *) echo 0 > "$RUN/$n.bad";;
     esac
   done
+  date -Is > "$RUN/watchdog.tick"  # Finished iteration, not merely entered.
 }
 loop_alive() { is_ours "$(sup_pid watchdog-loop)" "$SELF watchdog-loop"; }
 cmd_watchdog_loop() {
@@ -333,11 +384,41 @@ U
 cmd_restore() {
   lock_acquire restore "$SELF restore" || { echo "restore already running"; return 0; }
   trap 'lock_release restore' EXIT
+  local rc=0
   cmd_install || return 1
   cmd_boot
   [ ! -e "$RUN/maintenance" ] || { echo "MAINTENANCE: use start to resume"; return 0; }
+  if maa_wanted; then
+    bash "$AXH_HOME/maa-install.sh" >> "$LOGS/maa-install.log" 2>&1 || { log "MAA dependency restore failed; see maa-install.log"; rc=1; }
+  fi
   cmd_start
+  return "$rc"
 }   # 幂等，可反复执行；自动恢复不能撤销用户的 stop。
+cmd_session_restore() {  # Fresh platform exec only, never the local loop.
+  [ -e "$RUN/maintenance" ] && { echo MAINTENANCE; return 0; }
+  lock_acquire session "$SELF session-restore" || { echo "session recovery already running"; return 2; }
+  trap 'lock_release session' EXIT
+  local proxy_rc=0 i bad boot_id
+  date -Is > "$RUN/session.tick"
+  boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+  if [ "$(cat "$RUN/session.boot" 2>/dev/null)" != "$boot_id" ]; then
+    log "platform session observed new boot id=$boot_id"; echo "$boot_id" > "$RUN/session.boot"
+  fi
+  if proxy_mode; then cmd_set_proxy || proxy_rc=$?; fi
+  if bash "$SELF" health >/dev/null 2>&1 && [ "$proxy_rc" = 0 ]; then echo OK; return 0; fi
+  bash "$SELF" restore >> "$LOGS/session.log" 2>&1 || return 1
+  bash "$SELF" watchdog >> "$LOGS/session.log" 2>&1 || return 1
+  if ! curl --noproxy '*' -fs -m 3 "$(L "$MPORT")/ready" >/dev/null 2>&1 && tunnel_allowed; then
+    kill_child tunnel  # One bounded retry; preserve healthy existing connections.
+  fi
+  for i in $(seq 1 15); do
+    bad=$(check)
+    [ -n "$bad" ] || break
+    sleep 2
+  done
+  if [ "$proxy_rc" != 0 ]; then echo "NEEDS_FRESH_PROXY: local recovery attempted; platform must supply a fresh exec environment"; return 2; fi
+  bash "$SELF" health
+}
 cmd_upgrade() { AXH_UPGRADE=1 cmd_install && { kill_child axonhub; kill_child tunnel; sleep 3; cmd_status; }; }
 
 case "${1:-}" in
@@ -345,5 +426,8 @@ case "${1:-}" in
   health) cmd_health;; watchdog) cmd_watchdog;; boot) cmd_boot;; restore) cmd_restore;; upgrade) cmd_upgrade;;
   supervise) supervise "${2:-}";;
   watchdog-loop) cmd_watchdog_loop;;
+  session-restore) cmd_session_restore;;
+  maa-install) bash "$AXH_HOME/maa-install.sh";;
+  muse-hooks) python3 "$AXH_HOME/muse-hooks.py" "${2:?hooks directory required}";;
   *) sed -n '2,4p' "$0"; exit 1;;
 esac

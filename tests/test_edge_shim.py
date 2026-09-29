@@ -9,9 +9,12 @@ import shutil
 import ssl
 import subprocess
 import tempfile
+import sys
+import json
 import unittest
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 SPEC = importlib.util.spec_from_file_location('shim', Path(__file__).resolve().parents[1] / 'scripts/cloudflared-edge-shim.py')
 shim = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(shim)
@@ -107,6 +110,33 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(shim, 'TIMEOUT', 0.05):
             with self.assertRaises(TimeoutError):
                 await shim.connect_edge('region1.v2.argotunnel.com')
+
+    async def test_running_relay_reloads_rotated_credentials_without_dropping_connection(self):
+        await self.proxy(self.echo_proxy)
+        with tempfile.TemporaryDirectory(prefix='axh-proxy-') as directory:
+            with patch.dict(os.environ, {'AXH_HOME': directory}):
+                from axh_proxy import save_input
+                os.environ['AXH_PROXY_INPUT'] = os.environ['AXH_EDGE_PROXY']
+                save_input()
+                reader, writer = await self.relay()
+                self.assertEqual(await reader.readexactly(8), b'GREETING')
+                os.environ['AXH_PROXY_INPUT'] = os.environ['AXH_EDGE_PROXY'].replace('user:p%40ss', 'new:new-secret')
+                save_input()
+                # Old connection remains usable; a new connection sees the new auth.
+                writer.write(b'still-connected'); await writer.drain()
+                self.assertEqual(await reader.readexactly(15), b'still-connected')
+                second_reader, second_writer = await self.relay()
+                self.assertEqual(await second_reader.readexactly(8), b'GREETING')
+                self.assertIn(base64.b64encode(b'new:new-secret'), self.headers[-1])
+                for stream, output in ((reader, writer), (second_reader, second_writer)):
+                    output.write_eof(); await stream.read(); output.close()
+
+    def test_corrupt_proxy_file_does_not_fall_back_to_stale_env(self):
+        with tempfile.TemporaryDirectory(prefix='axh-proxy-') as directory:
+            Path(directory, 'proxy.json').write_text('{invalid')
+            with patch.dict(os.environ, {'AXH_HOME': directory, 'AXH_EDGE_PROXY': 'http://old:password@localhost:3128'}):
+                with self.assertRaises(shim.TransportError):
+                    shim.proxy_config()
 
     def test_invalid_proxy_does_not_expose_credentials(self):
         os.environ['AXH_EDGE_PROXY'] = 'socks5://secret:password@example.com:1080'

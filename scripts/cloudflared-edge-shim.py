@@ -8,6 +8,7 @@ import os
 import ssl
 import sys
 from urllib.parse import unquote, urlsplit
+from axh_proxy import read_proxy
 
 REGIONS = ("region1.v2.argotunnel.com", "region2.v2.argotunnel.com")
 TIMEOUT = 10
@@ -18,17 +19,15 @@ class TransportError(Exception):
 
 
 def proxy_config():
-    raw = next((os.environ[k] for k in
-                ("AXH_EDGE_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
-                if os.environ.get(k)), "")
     try:
+        raw = read_proxy()  # Re-read the atomic file for every CONNECT, including failover.
         url = urlsplit(raw)
         if url.scheme not in ("http", "https") or not url.hostname:
             raise ValueError()
         port = url.port or (443 if url.scheme == "https" else 80)
         if url.path not in ("", "/") or url.query or url.fragment:
             raise ValueError()
-    except ValueError:
+    except (ValueError, OSError, KeyError):
         raise TransportError("set an http:// or https:// proxy URL (value withheld)") from None
     auth = ""
     if url.username is not None:
