@@ -228,24 +228,25 @@ cmd_install() {
     fi
   done
   [ "$0" != "$SELF" ] && [ -f "$0" ] && { cp -f "$0" "$SELF.new" && mv -f "$SELF.new" "$SELF"; }
-  local A V zip tmp sums
+  local A V zip tmp sums axon_cache="$CACHE/StarTrai1-axonhub"
   case "$(uname -m)" in x86_64|amd64) A=amd64;; aarch64|arm64) A=arm64;; *) die "unsupported arch $(uname -m)";; esac
   if [ ! -x "$BIN/axonhub" ] || [ "${AXH_UPGRADE:-0}" = 1 ]; then
-    V="${AXONHUB_VERSION:-$(curl -fsSI -m 20 https://github.com/looplj/axonhub/releases/latest | tr -d '\r' | awk -F/ 'tolower($1)~/^location/{print $NF}')}"
-    [ -n "$V" ] || die "cannot resolve axonhub version (set AXONHUB_VERSION=v1.0.0-beta10)"
-    zip="$CACHE/axonhub_${V#v}_linux_${A}.zip"
+    V="${AXONHUB_VERSION:-$(curl -fsSI -m 20 https://github.com/StarTrai1/axonhub/releases/latest | tr -d '\r' | awk -F/ 'tolower($1)~/^location/{print $NF}')}"
+    [ -n "$V" ] || die "cannot resolve StarTrai1/axonhub version (set AXONHUB_VERSION to a tag published in that fork)"
+    mkdir -p "$axon_cache"
+    zip="$axon_cache/axonhub_${V#v}_linux_${A}.zip"
     if [ ! -s "$zip" ]; then
-      curl -fsSL --retry 3 -m 600 -o "$zip.part" "https://github.com/looplj/axonhub/releases/download/$V/$(basename "$zip")" || die "download axonhub failed"
+      curl -fsSL --retry 3 -m 600 -o "$zip.part" "https://github.com/StarTrai1/axonhub/releases/download/$V/$(basename "$zip")" || die "download axonhub failed"
       mv -f "$zip.part" "$zip"
     fi
-    sums=$(curl -fsSL -m 30 "https://github.com/looplj/axonhub/releases/download/$V/checksums.txt" 2>/dev/null | grep -F "$(basename "$zip")")
-    if [ -n "$sums" ]; then ( cd "$CACHE" && echo "$sums" | sha256sum -c - >/dev/null ) || { rm -f "$zip"; die "axonhub checksum mismatch"; }
+    sums=$(curl -fsSL -m 30 "https://github.com/StarTrai1/axonhub/releases/download/$V/checksums.txt" 2>/dev/null | grep -F "$(basename "$zip")")
+    if [ -n "$sums" ]; then ( cd "$axon_cache" && echo "$sums" | sha256sum -c - >/dev/null ) || { rm -f "$zip"; die "axonhub checksum mismatch"; }
     else log "WARN: checksums.txt unreachable, using cached zip unverified"; fi
     tmp=$(mktemp -d); { unzip -q -o "$zip" axonhub -d "$tmp" 2>/dev/null || python3 -m zipfile -e "$zip" "$tmp"; }
     [ -f "$tmp/axonhub" ] || die "unzip failed (need unzip or python3)"
     install -m755 "$tmp/axonhub" "$BIN/axonhub.new" && mv -f "$BIN/axonhub.new" "$BIN/axonhub"   # rename 替换：运行中也安全
-    rm -rf "$tmp"; ls -t "$CACHE"/axonhub_*.zip | tail -n +2 | xargs -r rm -f; echo "$V" > "$CACHE/axonhub.version"
-    log "installed axonhub $V"
+    rm -rf "$tmp"; ls -t "$axon_cache"/axonhub_*.zip | tail -n +2 | xargs -r rm -f; echo "$V" > "$CACHE/axonhub.version"
+    log "installed StarTrai1/axonhub $V"
   fi
   if [ ! -x "$BIN/cloudflared" ] || [ "${AXH_UPGRADE:-0}" = 1 ]; then
     curl -fsSL --retry 3 -m 300 -o "$BIN/cloudflared.new" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$A" || die "download cloudflared failed"

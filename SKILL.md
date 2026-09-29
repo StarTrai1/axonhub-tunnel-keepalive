@@ -1,11 +1,11 @@
 ---
 name: axonhub-tunnel-keepalive
-description: 在 Linux 主机、Muse 沙盒或容器中部署 AxonHub 官方发行包，通过 Cloudflare Tunnel 提供 HTTPS，并配置进程监督、看门狗、平台新会话恢复与 MuseAutoApprove 外联审批；处理 Muse 需要经 HTTP CONNECT 代理连接 Cloudflare edge 的部署故障。
+description: 在 Linux 主机、Muse 沙盒或容器中部署 StarTrai1/axonhub fork 发行包，通过 Cloudflare Tunnel 提供 HTTPS，并配置进程监督、看门狗、平台新会话恢复与 MuseAutoApprove 外联审批；处理 Muse 需要经 HTTP CONNECT 代理连接 Cloudflare edge 的部署故障。
 ---
 
 # AxonHub + Cloudflare Tunnel
 
-部署 `looplj/axonhub` 官方 Linux amd64/arm64 包。AxonHub 默认只监听 `127.0.0.1:8090`，Cloudflare 终结公网 HTTPS。状态、数据、令牌、代理配置、本地出站转发代理和可选的 MuseAutoApprove 和全部恢复脚本放在 `$AXH_HOME`（默认 `~/axonhub-stack`，必须是持久目录）。
+部署 [StarTrai1/axonhub fork Releases](https://github.com/StarTrai1/axonhub/releases) 的 Linux amd64/arm64 包。AxonHub 默认只监听 `127.0.0.1:8090`，Cloudflare 终结公网 HTTPS。状态、数据、令牌、代理配置、本地出站转发代理和可选的 MuseAutoApprove 和全部恢复脚本放在 `$AXH_HOME`（默认 `~/axonhub-stack`，必须是持久目录）。
 
 ## 工作顺序
 
@@ -33,7 +33,7 @@ AXH_HOSTNAME=axonhub.example.com
 # AXH_CF_PROTOCOL=http2              # 仅 UDP 7844 不通时
 # AXH_CF_TRANSPORT=proxy             # Muse CONNECT shim；先按 muse.md 配置并诊断
 AXONHUB_SERVER_SSE_KEEP_ALIVE_ENABLED=true
-# AXONHUB_VERSION=v...               # 可选：固定实际存在的 release
+# AXONHUB_VERSION=v...               # 可选：固定 fork 中实际发布的 release
 ```
 
 ```bash
@@ -72,6 +72,8 @@ curl -fsS https://axonhub.example.com/health
 代理模式下 AxonHub 的 HTTP(S)_PROXY 与 MAA 的 MUSE_PROXY（edge 模式）指向本地 `127.0.0.1:18080`；axproxy 每次新建连接读取 proxy.json，避免业务进程持有轮换密码。首次升级需重启业务进程一次以切换地址，后续凭据变化无需重启健康连接。
 
 Muse 不能以一次公网 200 作为保活验收。需核实新会话定时任务连续运行、凭据变化后新 CONNECT 使用新值、VM 全部进程丢失后外部恢复；没有平台执行能力时明确报告“本地保活已装，重启恢复/凭据续接未闭环”。轮换周期以现场证据为准，不把用户报告中的 1–2 小时或 1–2 分钟固化为平台契约。
+
+已有上游二进制不会因 `install` 自动替换。切换现有部署：先 `stop` 并备份数据，从新版技能目录执行 `install` 更新脚本，检查 env 中固定的 `AXONHUB_VERSION` 在 fork 中存在（否则改为 fork 标签或移除以使用 latest），再执行持久脚本的 `upgrade` 和 `start`。fork 压缩包独立缓存于 `cache/StarTrai1-axonhub/`，不复用旧来源的同名包。
 
 ## 运维与验证
 
