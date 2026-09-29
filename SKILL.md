@@ -5,7 +5,7 @@ description: 在 Linux 主机、Muse 沙盒或容器中部署 AxonHub 官方发�
 
 # AxonHub + Cloudflare Tunnel
 
-部署 `looplj/axonhub` 官方 Linux amd64/arm64 包。AxonHub 默认只监听 `127.0.0.1:8090`，Cloudflare 终结公网 HTTPS。状态、数据、令牌、代理配置、可选的 MuseAutoApprove 和全部恢复脚本放在 `$AXH_HOME`（默认 `~/axonhub-stack`，必须是持久目录）。
+部署 `looplj/axonhub` 官方 Linux amd64/arm64 包。AxonHub 默认只监听 `127.0.0.1:8090`，Cloudflare 终结公网 HTTPS。状态、数据、令牌、代理配置、本地出站转发代理和可选的 MuseAutoApprove 和全部恢复脚本放在 `$AXH_HOME`（默认 `~/axonhub-stack`，必须是持久目录）。
 
 ## 工作顺序
 
@@ -13,7 +13,7 @@ description: 在 Linux 主机、Muse 沙盒或容器中部署 AxonHub 官方发�
 
 - 正式使用：Cloudflare 中创建 Cloudflared Tunnel，将 Public Hostname 的 service 指向 `http://127.0.0.1:8090`；准备 tunnel token。
 - 临时测试：没有域名/令牌时用 `AXH_MODE=quick`，随机地址可能随重启改变，无 SLA。
-- Muse 部署必须接入 [平台恢复与凭据刷新](references/muse.md)；用户要求自动审批时接入 [MuseAutoApprove](references/muse-auto-approve.md)。
+- Muse 部署必须接入 [平台恢复与凭据刷新](references/muse.md)；用户要求自动审批时接入 [MuseAutoApprove](references/muse-auto-approve.md)，只覆盖 sentinel 队列中可识别的网络审批，命令审批另属通道，不能承诺自动处理。
 - Muse、出站受限、直连失败或报告 `hard_fail=true`：读取 [Muse 代理与重建](references/muse.md)。不要仅根据直连 precheck 断言环境无法部署。
 
 从技能目录执行；升级已有脚本时先用旧脚本 `stop`，再安装新脚本，以便旧监督进程退出：
@@ -56,7 +56,7 @@ curl -fsS https://axonhub.example.com/health
 
 | 层 | 实现 | 能恢复的故障 |
 |---|---|---|
-| 进程监督 | `supervise`，mkdir 锁、PID + cmdline 校验、崩溃退避 | AxonHub、cloudflared、代理 shim、已启用的 MAA 崩溃 |
+| 进程监督 | `supervise`，mkdir 锁、PID + cmdline 校验、崩溃退避 | AxonHub、cloudflared、shim、axproxy、已启用的 MAA 崩溃 |
 | 看门狗 | 正常运行的 cron；否则 `watchdog-loop` 每 60 秒执行一次 watchdog | 监督器丢失；本地 health / tunnel ready 连续 3 次失败后重启子进程 |
 | 重建恢复 | 本地 `restore`；平台钩子/每分钟任务用新 exec 调 `session-restore` | 系统目录和全部进程丢失后重建运行环境 |
 
@@ -69,6 +69,8 @@ curl -fsS https://axonhub.example.com/health
 - token 使用 `--token-file`；env、token、proxy.json、MAA 凭据权限 600；不输出代理认证信息。
 - 既有实例的数据、owner、配置不因补装而重置；不执行 `cloudflared service install`。
 
+代理模式下 AxonHub 的 HTTP(S)_PROXY 与 MAA 的 MUSE_PROXY（edge 模式）指向本地 `127.0.0.1:18080`；axproxy 每次新建连接读取 proxy.json，避免业务进程持有轮换密码。首次升级需重启业务进程一次以切换地址，后续凭据变化无需重启健康连接。
+
 Muse 不能以一次公网 200 作为保活验收。需核实新会话定时任务连续运行、凭据变化后新 CONNECT 使用新值、VM 全部进程丢失后外部恢复；没有平台执行能力时明确报告“本地保活已装，重启恢复/凭据续接未闭环”。轮换周期以现场证据为准，不把用户报告中的 1–2 小时或 1–2 分钟固化为平台契约。
 
 ## 运维与验证
@@ -76,7 +78,7 @@ Muse 不能以一次公网 200 作为保活验收。需核实新会话定时任�
 | 命令 | 含义 |
 |---|---|
 | `install` / `upgrade` | 补装 / 下载新版二进制；脚本更新需从新的技能目录执行 install |
-| `set-token` / `set-proxy` | 保存 token / 当前会话代理；shim 每次 CONNECT 重读 proxy.json，健康长连接不重启 |
+| `set-token` / `set-proxy` | 保存 token / 当前会话代理；shim/axproxy 每次 CONNECT 重读 proxy.json；MAA 健康则保持，不健康且凭据变化才重置监督器退避 |
 | `doctor` | Muse 路径的 CONNECT、edge TLS 诊断；proxy-ns 另检查 namespace；不代表隧道已注册 |
 | `start` / `stop` / `status` | 启动 / 维护停机 / 查看健康和看门狗最后执行时间 |
 | `health` | 退出码 0 健康或维护中，1 需恢复，2 无法检查 |
@@ -85,10 +87,12 @@ Muse 不能以一次公网 200 作为保活验收。需核实新会话定时任�
 | `maa-install` | 安装已审阅的 MuseAutoApprove 及依赖，账号和启用步骤见参考文件 |
 | `boot` / `restore` | 装看门狗与可用的开机入口 / 幂等补装并恢复，维护中保持停止 |
 
-可在 `env` 设置 `AXH_PORT`、`AXH_METRICS_PORT`、`AXH_WATCHDOG_BACKEND=auto|cron|loop`、`AXONHUB_VERSION` 和 AxonHub 的 `AXONHUB_*` 配置。升级前 `stop` 并备份 `data/`（SQLite WAL 不做普通热拷贝），升级后 `start`。发行包存在 checksums 时验证；取不到 checksums 会记录警告，交付时如实说明验证缺口。
+可在 `env` 设置 `AXH_PROXY_LOCAL_PORT`（默认 18080）、`AXH_DIRECT_HOSTS`（只填已验证可直连域名）、`AXH_PUBLIC_PROBE=direct|local-proxy`（默认直连，不隐式用旧凭据）、`AXH_PORT`、`AXH_METRICS_PORT`、`AXH_WATCHDOG_BACKEND=auto|cron|loop`、`AXONHUB_VERSION` 和 AxonHub 的 `AXONHUB_*` 配置。升级前 `stop` 并备份 `data/`（SQLite WAL 不做普通热拷贝），升级后 `start`。发行包存在 checksums 时验证；取不到 checksums 会记录警告，交付时如实说明验证缺口。
 
 在目标环境做一次有边界的故障演练：终止已核实的子进程观察监督恢复；终止监督器观察看门狗恢复；重复 restore 检查单实例；stop 后确认不被拉回。真实重启/重建另行验证，未做不能声称已通过。仓库离线回归：`python3 -m unittest discover -s tests -v`。
 
 本地真实二进制验证：`python3 tests/smoke_cloudflared.py /path/to/cloudflared`（需 openssl，已用 2026.9.3 验证）。使用本地假 edge 和测试凭据，检查 CONNECT、SNI、HTTP/2 帧，不注册真实隧道。
 
 排障先看 `$AXH_HOME/logs/{axonhub,tunnel,shim,watchdog,axh}.log`：无 cron 不必等待 apt；HTTP/2 仍失败走 Muse 诊断；公网 1033 看 tunnel ready，502 看 origin 路由与本地服务。不要用取消 TLS 校验来掩盖 CONNECT/TLS 失败。
+
+排查业务 407 必须复现实际 AI 请求，跨凭据轮换复测；401 只能证明到达服务商，不能证明对话成功。MAA 的 pending=0/心跳新鲜只证明队列轮询，不代表用户的审批卡片已覆盖；先按 [审批诊断](references/muse-auto-approve.md#审批覆盖与诊断) 区分队列和 schema。

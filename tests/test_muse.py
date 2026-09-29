@@ -63,9 +63,13 @@ class AutoApproveTests(unittest.TestCase):
             (stack / 'run').mkdir()
             (app / 'work/muse-rpc.cjs').write_text('''
 module.exports = {rpcCall: async (conn, method, params) => {
+ if (process.env.EMPTY_QUEUE && method === 'egress.approvals') return {pending: []};
  if (method === 'egress.approvals') return {pending: [
    {approval_id:'net', type:'egress', destination_domain:'example.com'},
    {approval_id:'reader', type:'reader_grant', destination_domain:'example.com'},
+   {approval_id:'command', registered_command:'curl https://example.com', host:'example.com', port:443, scheme:'https'},
+   {approval_id:'command-with-domain', registered_command:'curl', destination_domain:'example.com'},
+   {approval_id:'host-only', host:'example.com', port:443, scheme:'https'},
    {approval_id:'unknown', description:'please allow example.com'}]};
  return {ok:true};
 }};
@@ -79,6 +83,17 @@ const rpc = require(process.env.AXH_HOME + '/MuseAutoApprove/work/muse-rpc.cjs')
  const result = await rpc.rpcCall({}, 'egress.approvals', {});
  assert.deepEqual(result.pending.map(x=>x.approval_id), ['net']);
  await assert.rejects(rpc.rpcCall({}, 'egress.approval.decide', {approval_id:'reader'}));
+ await assert.rejects(rpc.rpcCall({}, 'egress.approval.decide', {approval_id:'command'}));
+ await assert.rejects(rpc.rpcCall({}, 'egress.approval.decide', {approval_id:'command-with-domain'}));
+ const file=process.env.AXH_HOME + '/run/maa.coverage.json';
+ const initial=JSON.parse(fs.readFileSync(file));
+ assert.equal(initial.visible_pending, 6);
+ assert.equal(initial.eligible_pending, 1);
+ assert.equal(initial.skipped_command, 2);
+ assert.equal(initial.decision_rpc_ok, 0);
+ await rpc.rpcCall({}, 'egress.approval.decide', {approval_id:'net', decision:'allow_once'});
+ assert.equal(JSON.parse(fs.readFileSync(file)).decision_rpc_ok, 1);
+ assert(!fs.readFileSync(file, 'utf8').includes('registered_command'));
  assert(fs.existsSync(process.env.AXH_HOME + '/run/maa.ok'));
  console.log('http://user:secret@proxy.test password=verysecret');
  fs.appendFileSync(process.env.AXH_HOME + '/MuseAutoApprove/log/daemon-log.ndjson',
@@ -90,6 +105,26 @@ const rpc = require(process.env.AXH_HOME + '/MuseAutoApprove/work/muse-rpc.cjs')
                          capture_output=True, text=True, check=True)
             output = result.stdout + result.stderr + (app / 'log/daemon-log.ndjson').read_text()
             self.assertNotIn('secret', output)
+            # A new healthy poller with an empty queue must not report decision success.
+            empty = stack / 'empty.cjs'
+            empty.write_text('''
+const fs=require('fs'); const assert=require('assert');
+require(process.env.ADAPTER).install();
+const rpc=require(process.env.AXH_HOME+'/MuseAutoApprove/work/muse-rpc.cjs');
+(async()=>{
+ await rpc.rpcCall({},'egress.approvals',{});
+ const state=JSON.parse(fs.readFileSync(process.env.AXH_HOME+'/run/maa.coverage.json'));
+ assert.equal(state.polls,1); assert.equal(state.visible_pending,0); assert.equal(state.decision_rpc_ok,0);
+ assert.equal(state.command_approvals,'unsupported');
+})().catch(e=>{console.error(e);process.exit(1)});
+''')
+            env = {**os.environ, 'AXH_HOME': directory, 'MUSE_VM_ID': 'test-vm',
+                   'ADAPTER': str(ROOT / 'scripts/maa-adapter.cjs'), 'EMPTY_QUEUE': '1'}
+            subprocess.run(['node', str(empty)], env=env, check=True, capture_output=True)
+            status = subprocess.run(['node', str(ROOT / 'scripts/maa-adapter.cjs'), '--status'], env=env,
+                                    check=True, capture_output=True, text=True).stdout
+            self.assertIn('command approvals unsupported', status)
+            self.assertIn('0 successful', status)
 
 
 if __name__ == '__main__':

@@ -21,6 +21,9 @@ tunnel = Path(sys.argv[0]).name == 'cloudflared'
 port = int(os.environ['AXH_METRICS_PORT'] if tunnel else os.environ['AXH_PORT'])
 if tunnel:
     (stack / 'run/tunnel.args').write_text(json.dumps(sys.argv[1:]))
+else:
+    (stack / 'run/axonhub.env').write_text(json.dumps({k: os.environ.get(k) for k in
+        ('HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy', 'ALL_PROXY', 'NO_PROXY')}))
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         initialized = (stack / 'data/initialized').exists()
@@ -54,6 +57,7 @@ class StackTests(unittest.TestCase):
             path.chmod(0o700)
         self.env = {**os.environ, 'AXH_HOME': str(self.stack), 'AXH_PORT': str(free_port()),
                     'AXH_METRICS_PORT': str(free_port()), 'AXH_MODE': 'quick',
+                    'AXH_PROXY_LOCAL_PORT': str(free_port()),
                     'AXH_WATCHDOG_BACKEND': 'loop', 'AXH_CF_TRANSPORT': 'direct',
                     'HTTP_PROXY': 'http://127.0.0.1:1', 'HTTPS_PROXY': 'http://127.0.0.1:1',
                     'ALL_PROXY': 'http://127.0.0.1:1', 'NO_PROXY': '', 'no_proxy': ''}
@@ -80,7 +84,7 @@ class StackTests(unittest.TestCase):
 
     def tearDown(self):
         self.call('stop', check=False)
-        for name in ('watchdog-loop', 'axonhub', 'tunnel', 'shim', 'maa'):
+        for name in ('watchdog-loop', 'axonhub', 'tunnel', 'shim', 'maa', 'axproxy'):
             pid = self.pid(name)
             try:
                 if pid and str(self.stack).encode() in Path(f'/proc/{pid}/cmdline').read_bytes():
@@ -158,6 +162,10 @@ class StackTests(unittest.TestCase):
         self.env['AXH_CF_TRANSPORT'] = 'proxy'
         self.call('set-proxy')
         self.call('start')
+        self.wait_for(lambda: self.pid('axproxy', child=True))
+        environment = json.loads((self.stack / 'run/axonhub.env').read_text())
+        for key in ('HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy', 'ALL_PROXY'):
+            self.assertEqual(environment[key], 'http://127.0.0.1:' + self.env['AXH_PROXY_LOCAL_PORT'])
         self.wait_for(lambda: self.pid('shim', child=True))
         args = json.loads((self.stack / 'run/tunnel.args').read_text())
         self.assertEqual(args[args.index('--protocol') + 1], 'http2')
@@ -176,6 +184,7 @@ class StackTests(unittest.TestCase):
         self.wait_for(lambda: self.call('health', check=False).returncode == 0)
         self.call('stop')
         self.assertFalse(Path(f'/proc/{tunnel_pid}/cmdline').exists())
+        self.assertEqual(self.pid('axproxy'), 0)
 
     def test_cron_absent_daemon_falls_back_without_package_install(self):
         fixture = self.stack / 'cron-fixture.sh'
@@ -299,6 +308,59 @@ setInterval(()=>rpc.rpcCall({}, 'egress.approvals', {}), 100);
         self.wait_for(lambda: self.pid('maa') == 0)
         self.call('watchdog')
         self.assertEqual(self.pid('maa'), 0)
+
+    def test_maa_rotation_preserves_healthy_daemon_and_resets_failed_supervisor(self):
+        if not shutil.which('node'):
+            self.skipTest('Node required')
+        self.env.update(AXH_MAA_ENABLED='1', AXH_MAA_PROXY='edge', MUSE_VM_ID='test-vm', AXH_NODE_BIN=shutil.which('node'))
+        app = self.stack / 'MuseAutoApprove'
+        for folder in ('work', 'data', 'log'):
+            (app / folder).mkdir(parents=True)
+        (app / 'work/muse-rpc.cjs').write_text('module.exports={rpcCall:async()=>({pending:[]})};')
+        (app / 'muse-daemon.cjs').write_text('''
+const fs=require('fs');
+if (!fs.existsSync(process.env.AXH_HOME+'/data/maa-can-connect')) process.exit(1);
+fs.writeFileSync(process.env.AXH_HOME+'/run/maa.proxy',process.env.MUSE_PROXY);
+const rpc=require('./work/muse-rpc.cjs');
+setInterval(()=>rpc.rpcCall({},'egress.approvals',{}),100);
+''')
+        (self.stack / 'data/initialized').touch()
+        self.call('start')
+        self.wait_for(lambda: 'maa exited rc=1' in (self.stack / 'logs/axh.log').read_text())
+        supervisor = self.pid('maa')
+        (self.stack / 'data/maa-can-connect').touch()
+        self.env['HTTPS_PROXY'] = 'http://fresh:secret@127.0.0.1:4321'
+        self.call('set-proxy')
+        self.wait_for(lambda: self.pid('maa') not in (0, supervisor) and (self.stack / 'run/maa.ok').exists(), timeout=5)
+        self.assertEqual((self.stack / 'run/maa.proxy').read_text(), 'http://127.0.0.1:' + self.env['AXH_PROXY_LOCAL_PORT'])
+        supervisor, child = self.pid('maa'), self.pid('maa', child=True)
+        self.env['HTTPS_PROXY'] = 'http://newer:secret@127.0.0.1:4321'
+        self.call('set-proxy')
+        self.assertEqual(self.pid('maa'), supervisor)
+        self.assertEqual(self.pid('maa', child=True), child)
+        self.call('stop')
+        self.env['HTTPS_PROXY'] = 'http://last:secret@127.0.0.1:4321'
+        self.call('set-proxy')
+        self.assertEqual(self.pid('maa'), 0)
+
+    def test_public_status_uses_direct_probe_despite_expired_proxy(self):
+        # Observe curl arguments without contacting any public service.
+        fixture = self.stack / 'curl-fixture.sh'
+        fixture.write_text('''
+curl() {
+  case "${*: -1}" in
+    https://probe.invalid/health)
+      [ "$1" = --noproxy ] && [ "$2" = '*' ] && return 0
+      return 22;;
+    */admin/system/status) echo '{"isInitialized":true}';;
+  esac
+}
+''')
+        self.env.update(BASH_ENV=str(fixture), AXH_HOSTNAME='probe.invalid')
+        (self.stack / 'tunnel.token').write_text('fake')
+        output = self.call('status').stdout
+        self.assertIn('public    https     : ok', output)
+        self.assertIn('; direct)', output)
 
 
 if __name__ == '__main__':

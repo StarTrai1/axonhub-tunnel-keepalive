@@ -54,6 +54,36 @@ doctor 模仿 cloudflared 的 HTTP/2 TLS 设置：验证证书与 `h2.cftunnel.c
 
 如果代理端的域名解析也有问题，可在 env 中设置 `AXH_EDGE_TARGETS=<当前官方 region1 IP>,<当前官方 region2 IP>`，逗号分隔、**不带端口**。先核对 Cloudflare 当前地址表并确认代理允许 IP CONNECT；不要把社区旧 IP 永久硬编码。shim 始终连接目标 7844，TLS SNI/证书校验不变。
 
+## AxonHub 业务出站的本地代理
+
+2026-09-29 的现场复盘报告凭据约 60–75 秒轮换，且服务商 POST 真实失败。这个时间是现场测量值，不是所有 Muse 环境的固定契约。文件更新只会改变后续读取文件的程序，不会更新既有 Go/Node 进程的环境；Go 标准库的环境代理函数还使用 sync.Once 缓存配置（见 [transport.go](https://go.dev/src/net/http/transport.go)）。
+
+代理模式自动监督 `axproxy`，先启动本地 listener，再启动 AxonHub/MAA。`AXH_MAA_PROXY=edge` 即使配合 direct 隧道模式，也会启用 axproxy：
+
+```text
+AxonHub / MAA / cloudflared 的 HTTP API
+  → 无凭据本地代理 http://127.0.0.1:18080
+  → 每条新连接读取 proxy.json
+  → 经上游 HTTP(S) 代理 CONNECT 真实目标
+  → 服务商 HTTPS/TLS、Muse WS/token API（加密字节透传）
+```
+
+`AXH_PROXY_LOCAL_PORT` 可改端口，仅绑定回环，不能把它发布成公网服务。AxonHub 大小写 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 均指向这里；MAA edge 模式的 MUSE_PROXY 也用它。首次从旧脚本迁移需停止旧服务、安装全部脚本并启动一次，后续轮换不重启健康业务进程。检查 AxonHub channel 的显式代理配置和已有 NO_PROXY，避免绕过环境代理。
+
+代理接受 HTTPS CONNECT 和绝对 URI 的 HTTP 请求。普通 HTTP 会先 CONNECT 到目标 HTTP 端口，再转成 origin-form 请求；上游须允许该目标端口，拒绝时明确失败，不假设可以从 80 换到 443。HTTP 请求携带 `Connection: close`，HTTPS/WS/SSE 隧道保持字节透传与背压，不拦截证书、不记录请求体或 URL。
+
+遇到上游 CONNECT 407，仅当重读文件发现凭据已改变时，再尝试一次 CONNECT；此时业务请求尚未发送。凭据不变、其他错误或业务数据已经发送后均不重放请求。代理拒绝在客户端表现为 502，`logs/axproxy.log` 保留脱敏的上游 CONNECT 状态码。它不能自行生成新密码，平台新会话供应中断时仍会失败。
+
+`AXH_DIRECT_HOSTS` 是可选补充：只填已实测直连可达的域名，默认不硬编码 GitHub 或服务商域名；其他目标仍走 axproxy。修改 bypass 配置需重启客户端一次，不能把修改 shell 环境误认为运行中的 Go/Node 已更新。
+
+## 407 与公网探针排障
+
+- 默认 `status` 的公网探针明确 `--noproxy '*'`，与凭据链路分离。若目标环境禁止直连，设 `AXH_PUBLIC_PROBE=local-proxy`，输出会标明经本地代理；不隐藏此依赖。
+- 先按时间戳和请求来源区分 catalog/更新检查、MAA 建连、真实 AI 调用。复测用户实际 POST/流式对话，并在下一个凭据版本重复；“日志无新增”不代表业务已恢复。
+- `/health`、`/ready`、axproxy TCP listener 分别证明对应组件存活，不证明服务商请求成功。无 API key 的 401 只能证明请求到达服务商，不能报告真实对话通过。
+- `axh.log` 和本技能 tick 使用 UTC ISO 8601；上游自己的日志按其时区换算，不清空日志掩盖历史问题。
+- MAA 心跳新鲜且 daemon 存活时，凭据变化不打断其 WS；不健康时 `restart_sup maa` 等旧 supervisor 退出后启动新的 supervisor，清除累计退避。停止标记和整栈维护模式仍优先。
+
 ## 新会话刷新 + VM 重建恢复（部署必须完成）
 
 本地 watchdog 的子进程只继承旧环境，重启 shim 也不会产生新密码。外部恢复不能只在 `health` 失败时运行：隧道仍健康时也要接收新会话凭据，供下一次重连使用。
@@ -64,7 +94,7 @@ doctor 模仿 cloudflared 的 HTTP/2 TLS 设置：验证证书与 `h2.cftunnel.c
 AXH_HOME=/实际持久路径/axonhub-stack bash /实际持久路径/axonhub-stack/axh.sh session-restore
 ```
 
-`session-restore` 顺序：尊重维护标记 → 单实例 → 记录本轮 exec/boot ID → 保存新环境代理 → 检查服务 → 必要时 restore/watchdog → 对未 ready 的 tunnel 进行一次有界重启和复查。正常长连接不因密码变化被杀；MAA 使用 edge 代理时单独重新加载。固定域名存在却缺 token 会报错，绝不自动切 Quick Tunnel。
+`session-restore` 顺序：尊重维护标记 → 单实例 → 记录本轮 exec/boot ID → 保存新环境代理 → 检查服务 → 必要时 restore/watchdog → 对未 ready 的 tunnel 进行一次有界重启和复查。正常长连接不因密码变化被杀；MAA 的 edge 模式也经 axproxy，以便 WS 重连和五分钟 token touch 使用新凭据；健康时不重启，不健康且凭据变化时整体重启监督器清除退避。固定域名存在却缺 token 会报错，绝不自动切 Quick Tunnel。
 
 **只能由新平台会话调用。** 不先 source stack/env、proxy.env，也不要从旧终端、旧 watchdog、旧 supervisor 调用来伪装新环境。优先读取本轮 exec 注入的 HTTPS_PROXY；如果平台根本不提供新值，明确报告 `NEEDS_FRESH_PROXY`，不能声称凭据已经续期。自动审批登录 token、CF tunnel token 和 egress proxy 密码是三种不同凭据。
 
@@ -83,7 +113,7 @@ AXH_HOME=/实际持久路径/axonhub-stack bash /实际持久路径/axonhub-stac
 ### 验证故障闭环
 
 - 在测试环境中终止这套应用的全部已核实进程，让平台任务恢复，检查 owner/data/token/正式域名不变；不是重启宿主机，不碰其他应用。
-- 用两个不泄露的凭据版本验证新会话写入后，已运行 shim 的新 CONNECT 使用新值，同时既有连接保持。
+- 用两个不泄露的凭据版本验证新会话写入后，已运行 shim/axproxy 的新 CONNECT 使用新值，同时既有连接保持。
 - 真实 VM 重启/重建需当前部署授权和平台运行记录；没有实际重建过就分开报告，不把模拟进程全灭等同于重建验收。
 - 保存脱敏证据：boot ID、uptime、最后完成的 watchdog tick、新会话 tick、CONNECT 状态、/ready、公网 /health。TLS EOF 单独不能证明密码到期，代理 407/新旧凭据对照才更有指向性。
 
