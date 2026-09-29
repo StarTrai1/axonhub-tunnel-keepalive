@@ -1,99 +1,87 @@
 ---
 name: axonhub-tunnel-keepalive
-description: 在没有公网 IP 的 Linux 主机/沙盒/容器上部署 looplj/axonhub（AI 网关）官方 linux 发行包，用 Cloudflare Tunnel 提供 HTTPS 访问，并带三层保活（进程监督 + 看门狗 + 重建恢复）。只要用户提到部署/安装/保活/自启/重建后恢复 axonhub，或想把本地服务通过 Cloudflare Tunnel / cloudflared 暴露成 https 域名，或说"沙盒重启后服务就没了"，就使用本技能，即使他没有明确说"skill"或"保活"。
+description: 在 Linux 主机、Muse 沙盒或容器中部署 AxonHub 官方发行包，通过 Cloudflare Tunnel 提供 HTTPS，并配置进程监督、看门狗和持久化恢复；处理 Muse 需要经 HTTP CONNECT 代理连接 Cloudflare edge 的部署故障。
 ---
 
-# AxonHub + Cloudflare Tunnel 保活部署
+# AxonHub + Cloudflare Tunnel
 
-```
-浏览器/SDK ──HTTPS──▶ Cloudflare 边缘 ◀──出站长连接── cloudflared ──▶ 127.0.0.1:8090 axonhub
-```
+部署 `looplj/axonhub` 官方 Linux amd64/arm64 包。AxonHub 默认只监听 `127.0.0.1:8090`，Cloudflare 终结公网 HTTPS。状态、数据、令牌、代理配置和全部恢复脚本放在 `$AXH_HOME`（默认 `~/axonhub-stack`，必须是持久目录）。
 
-主机只出站，不需要公网 IP 和开放端口；HTTPS 由 Cloudflare 终结；axonhub 只监听回环地址。全部逻辑在一个脚本 `scripts/axh.sh`（安装、监督、看门狗、恢复），状态全在 `$AXH_HOME`（默认 `~/axonhub-stack`，**必须放持久盘**）。
+## 工作顺序
 
-## 保活原理（三层）
+先检查已有实例、`$AXH_HOME/env`、owner 初始化状态和平台的持久盘位置；复用已有数据与授权。只询问缺失的域名/隧道令牌、owner 信息。已初始化的实例不要重新初始化。
 
-| 层 | 机制 | 对付的故障 |
-|---|---|---|
-| L1 监督 | `supervise`：mkdir 原子锁 + 重启循环 + 崩溃退避 | 进程崩溃（秒级） |
-| L2 看门狗 | cron 每分钟：补拉缺失的监督进程；`/health`、cloudflared `/ready` 连续 3 次失败则杀子进程重启 | 进程还在但服务卡死（≤3 分钟） |
-| L3 恢复 | `restore` 幂等 + `boot`（@reboot/systemd）+ 外部巡检调 `health` | 整机重启/沙盒重建，cron 与进程全丢 |
+- 正式使用：Cloudflare 中创建 Cloudflared Tunnel，将 Public Hostname 的 service 指向 `http://127.0.0.1:8090`；准备 tunnel token。
+- 临时测试：没有域名/令牌时用 `AXH_MODE=quick`，随机地址可能随重启改变，无 SLA。
+- Muse、出站受限、直连失败或报告 `hard_fail=true`：读取 [Muse 代理与重建](references/muse.md)。不要仅根据直连 precheck 断言环境无法部署。
 
-踩过的坑，已写进脚本，改动时别破坏：
-- **锁用 `mkdir`，不用 `flock`**：flock 的 fd 会被子进程继承，监督进程被杀后孤儿永久占锁。
-- **认进程只用 pidfile + `/proc/<pid>/cmdline`**，不用 `pkill -f`（会误杀自己的 shell；测试时 `pgrep -f` 同样会匹配到检查命令本身）。
-- **进程活着 ≠ 服务活着**：以 axonhub `/health` 和 cloudflared `/ready`（已连上 CF 边缘）为准。
-- **升级用 rename 替换二进制**（`mv -f`），运行中也安全；日志原地截断，不 `mv`，避免 fd 指向已删除文件。
-- **令牌走 `--token-file`**，不进命令行；日志不重定向到 `/dev/null`。
-- **`stop` 写维护标记**，看门狗不再拉起，避免"停不掉"。
-
-## 动手前向用户确认
-
-1. 域名已托管在 Cloudflare？没有 → 只能用 quick 模式（随机 `trycloudflare.com` 地址，重启即变，无 SLA，仅测试）。
-2. 让用户在 Cloudflare Zero Trust → Networks → Tunnels 创建 **Cloudflared** 类型隧道，复制令牌（整条安装命令也行）；在该隧道的 **Public Hostname** 里把域名指向 **HTTP `localhost:8090`**。
-3. axonhub owner 的邮箱、密码。机器重建后 `$AXH_HOME` 是否保留？（不保留就必须配外部巡检，见步骤 6）
-
-令牌和密码只写入 600 权限文件，不回显、不写进记忆或日志。
-
-## 步骤
+从技能目录执行；升级已有脚本时先用旧脚本 `stop`，再安装新脚本，以便旧监督进程退出：
 
 ```bash
-# 1. 落盘并安装（在技能目录下执行；下载 axonhub 最新 linux 包并校验 sha256、下载 cloudflared）
-export AXH_HOME=~/axonhub-stack; mkdir -p $AXH_HOME && cp scripts/axh.sh $AXH_HOME/ && bash $AXH_HOME/axh.sh install
-
-# 2. 写入隧道令牌（从 stdin 读，可直接粘贴 Cloudflare 给的整条命令）
-bash $AXH_HOME/axh.sh set-token          # 粘贴后 Ctrl-D
-echo 'AXH_HOSTNAME=axonhub.example.com' >> $AXH_HOME/env    # 用于公网 HTTPS 自检
-echo 'AXONHUB_SERVER_SSE_KEEP_ALIVE_ENABLED=true' >> $AXH_HOME/env   # 默认关闭；流式响应保活，防 CF 524
-
-# 3. 启动，并在暴露前先初始化 owner（/admin/system/initialize 无鉴权，谁先到谁当 owner）
-bash $AXH_HOME/axh.sh start              # 此时隧道被闸门拦住，日志会写 "tunnel withheld"
-curl -s -X POST http://127.0.0.1:8090/admin/system/initialize -H 'Content-Type: application/json' -d @- <<'J'
-{"ownerEmail":"<邮箱>","ownerPassword":"<密码>","ownerFirstName":"<名>","ownerLastName":"<姓>","brandName":"AxonHub"}
-J
-bash $AXH_HOME/axh.sh start              # 已初始化 → 隧道启动（或等看门狗下一轮）
-
-# 4. 装保活：cron 每分钟看门狗 + @reboot；有 systemd 且是 root 时再加 unit
-bash $AXH_HOME/axh.sh boot
-
-# 5. 验证
-bash $AXH_HOME/axh.sh status             # 期望全部 ok/yes，public https: ok
-curl -i https://axonhub.example.com/health
+export AXH_HOME="$HOME/axonhub-stack"
+bash scripts/axh.sh install          # 把三个脚本一起持久化，补装发行包
+bash "$AXH_HOME/axh.sh" set-token    # 从 stdin 读；粘贴后 Ctrl-D，不把令牌放 argv
 ```
 
-用户随后访问 `https://<域名>/` 登录后台，配置 channel 与 API key；SDK 的 base URL 为 `https://<域名>/v1`。
+编辑 `$AXH_HOME/env`（保留已有设置，避免重复追加）：
 
-6. **重建场景（只有持久盘保留时）**：cron 和 systemd 会随重建消失，必须由外部触发——平台开机钩子执行 `bash $AXH_HOME/axh.sh restore`；外部每分钟巡检 `bash $AXH_HOME/axh.sh health`：退出码 0 静默，1 → 跑 `restore`，2 → 本轮跳过。
-7. **演练（必做，用日志证据说话）**：杀 axonhub 子进程 → 数秒内被拉回；`kill -9` 监督进程 → 一分钟内看门狗拉回且无重复进程；`restore` 反复执行不产生第二个实例。
+```bash
+AXH_HOSTNAME=axonhub.example.com
+# AXH_MODE=quick                     # 无 token 的临时部署才开启
+# AXH_CF_PROTOCOL=http2              # 仅 UDP 7844 不通时
+# AXH_CF_TRANSPORT=proxy             # Muse CONNECT shim；先按 muse.md 配置并诊断
+AXONHUB_SERVER_SSE_KEEP_ALIVE_ENABLED=true
+# AXONHUB_VERSION=v...               # 可选：固定实际存在的 release
+```
 
-## 命令
+```bash
+bash "$AXH_HOME/axh.sh" start
+```
 
-| 命令 | 作用 |
+未初始化时脚本会暂缓启动隧道。通过本地 `/admin/system/status` 检查 `isInitialized`；必要时用 `curl --noproxy '*' -fsS -X POST http://127.0.0.1:8090/admin/system/initialize -H 'Content-Type: application/json' --data-binary @-` 从 stdin 提交 JSON：`ownerEmail`、`ownerPassword`、`ownerFirstName`、`ownerLastName`、`brandName`。不要在日志或命令参数里留下密码。
+
+```bash
+bash "$AXH_HOME/axh.sh" start        # owner 已初始化后隧道才会启动
+bash "$AXH_HOME/axh.sh" boot         # 工作中的 cron；否则自动使用 60s 看门狗循环
+bash "$AXH_HOME/axh.sh" status
+bash "$AXH_HOME/axh.sh" health
+curl -fsS https://axonhub.example.com/health
+```
+
+验收必须区分：本地 `/health` 成功、owner 已初始化、cloudflared `/ready` 成功、实际公网 HTTPS 成功。quick 模式也必须用输出的 URL 请求 `/health`；分配了 URL 不代表隧道连通。后台入口 `https://<域名>/`；SDK base URL 为 `https://<域名>/v1`。
+
+## 保活与恢复
+
+| 层 | 实现 | 能恢复的故障 |
+|---|---|---|
+| 进程监督 | `supervise`，mkdir 锁、PID + cmdline 校验、崩溃退避 | AxonHub、cloudflared、代理 shim 崩溃 |
+| 看门狗 | 正常运行的 cron；否则 `watchdog-loop` 每 60 秒执行一次 watchdog | 监督器丢失；本地 health / tunnel ready 连续 3 次失败后重启子进程 |
+| 重建恢复 | 持久目录中的 `restore`，可用的 @reboot/systemd 开机入口，加平台开机钩子与外部巡检 | 系统目录和全部进程丢失后重建运行环境 |
+
+`nohup`、cron、systemd 都不能保证 Muse 不休眠或不回收；循环也不能在整机销毁后自行运行。Muse 的外部巡检和开机钩子按 [muse.md](references/muse.md) 接入。不保留持久目录时，还需要从已有备份恢复数据；外部巡检本身不能恢复消失的数据库。
+
+保留这些不变量：
+- `stop` 写维护标记；watchdog 和 `restore` 都不得撤销它，只有 `start` 恢复服务。
+- 不用 `pkill -f`；根据 pidfile 和真实子进程命令行判断，namespace 脚本最后 `exec cloudflared`。
+- 监督器锁不向子进程传递持锁 fd；二进制通过 rename 替换，日志原地截断。
+- token 使用 `--token-file`；env、token、proxy.env 权限 600；不输出代理认证信息。
+- 既有实例的数据、owner、配置不因补装而重置；不执行 `cloudflared service install`。
+
+## 运维与验证
+
+| 命令 | 含义 |
 |---|---|
-| `install` | 装/补装二进制（幂等，缓存在 `cache/`，可离线复用） |
-| `set-token` | 从 stdin 提取令牌写入 600 文件 |
-| `start` / `stop` | 启动 / 停止并进入维护模式 |
-| `status` | 监督进程、健康、是否已初始化、隧道就绪、公网 HTTPS |
-| `health` | 退出码 0 健康 / 1 需恢复 / 2 无法判断（供外部巡检） |
-| `watchdog` | 看门狗（cron 调用） |
-| `boot` / `restore` | 写 cron+systemd / 一键幂等恢复 |
-| `upgrade` | 升级两个二进制并重启子进程（升级前先 `stop`，再备份 `data/`：sqlite 是 WAL，别热拷贝） |
+| `install` / `upgrade` | 补装 / 下载新版二进制；脚本更新需从新的技能目录执行 install |
+| `set-token` / `set-proxy` | 保存 token / 当前环境中的代理；配置改变后 stop/start 使监督器重新加载 |
+| `doctor` | Muse 路径的 CONNECT、edge TLS 诊断；proxy-ns 另检查 namespace；不代表隧道已注册 |
+| `start` / `stop` / `status` | 启动 / 维护停机 / 查看健康和看门狗最后执行时间 |
+| `health` | 退出码 0 健康或维护中，1 需恢复，2 无法检查 |
+| `boot` / `restore` | 装看门狗与可用的开机入口 / 幂等补装并恢复，维护中保持停止 |
 
-`$AXH_HOME/env` 可设：`AXH_PORT`、`AXH_HOSTNAME`、`AXH_MODE=quick`、`AXH_CF_PROTOCOL=http2`、`AXONHUB_VERSION`（锁定版本；latest 目前是 beta）、任意 `AXONHUB_*`（如换 Postgres：`AXONHUB_DB_DIALECT`、`AXONHUB_DB_DSN`）。
+可在 `env` 设置 `AXH_PORT`、`AXH_METRICS_PORT`、`AXH_WATCHDOG_BACKEND=auto|cron|loop`、`AXONHUB_VERSION` 和 AxonHub 的 `AXONHUB_*` 配置。升级前 `stop` 并备份 `data/`（SQLite WAL 不做普通热拷贝），升级后 `start`。发行包存在 checksums 时验证；取不到 checksums 会记录警告，交付时如实说明验证缺口。
 
-## 排障
+在目标环境做一次有边界的故障演练：终止已核实的子进程观察监督恢复；终止监督器观察看门狗恢复；重复 restore 检查单实例；stop 后确认不被拉回。真实重启/重建另行验证，未做不能声称已通过。仓库离线回归：`python3 -m unittest discover -s tests -v`。
 
-| 现象 | 原因 → 处理 |
-|---|---|
-| `tunnel ready: NO`，日志有 `Failed to dial a quic connection` | UDP 7844 被封 → env 加 `AXH_CF_PROTOCOL=http2`；仍不通则出站 `*.argotunnel.com:7844` 被防火墙拦 |
-| 公网 502 / 1033 | Public Hostname 服务不是 `http://localhost:8090`，或隧道未连上 |
-| 流式响应中途 524 | 没开 SSE keep-alive（见步骤 2） |
-| `tunnel withheld` | 实例未初始化，做步骤 3；确需绕过才设 `AXH_ALLOW_UNINIT=1` |
-| 看门狗不生效 | 无 cron 守护进程或无 `crontab` → 用外部巡检（步骤 6） |
-| 下载失败 / checksum 报错 | GitHub 不通：把 `axonhub_<版本>_linux_<架构>.zip` 放进 `cache/` 并设 `AXONHUB_VERSION` |
-| 重复进程、端口被占 | 用 `status` 看监督进程；杀进程只走 `stop`，别用 `pkill -f` |
+本地真实二进制验证：`python3 tests/smoke_cloudflared.py /path/to/cloudflared`（需 openssl，已用 2026.9.3 验证）。使用本地假 edge 和测试凭据，检查 CONNECT、SNI、HTTP/2 帧，不注册真实隧道。
 
-## 安全与边界
-
-- 别在 Cloudflare Access 里覆盖 API 路径（`/v1` 等），SDK 无法通过登录页；如需保护后台，先确认具体路径。
-- 仅支持 linux amd64 / arm64。cron 安装与 systemd unit 未在真实环境验证过，交付前请在目标机器上跑一遍步骤 7。
+排障先看 `$AXH_HOME/logs/{axonhub,tunnel,shim,watchdog,axh}.log`：无 cron 不必等待 apt；HTTP/2 仍失败走 Muse 诊断；公网 1033 看 tunnel ready，502 看 origin 路由与本地服务。不要用取消 TLS 校验来掩盖 CONNECT/TLS 失败。
